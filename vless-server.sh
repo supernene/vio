@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.3 [服务端]
+#  多协议代理一键部署脚本 v3.5.4 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,11 +17,11 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.3"
+readonly VERSION="3.5.4"
 readonly AUTHOR="Zyx0rx"
-readonly REPO_URL="https://github.com/Zyx0rx/vless-all-in-one"
-readonly SCRIPT_REPO="Zyx0rx/vless-all-in-one"
-readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/Zyx0rx/vless-all-in-one/main/vless-server.sh"
+readonly REPO_URL="https://github.com/supernene/vio"
+readonly SCRIPT_REPO="supernene/vio"
+readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/supernene/vio/main/vless-server.sh"
 readonly CFG="/etc/vless-reality"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
@@ -2699,13 +2699,16 @@ _handle_standalone_cert() {
             _warn "检测到 CA 签发的真实证书，不会覆盖"
             return 1
         fi
-        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
-        gen_self_cert "$sni"
+        if [[ -e "$CFG/certs/server.crt" || -e "$CFG/certs/server.key" ]]; then
+            _warn "共享证书已存在，不自动覆盖"
+            return 1
+        fi
+        gen_self_cert "$sni" || return 1
         # 自签证书使用独立的标记文件，不写入 cert_domain (避免与 ACME 证书混淆)
         echo "$sni" > "$CFG/self_cert_sni"
         rm -f "$CFG/cert_domain"  # 清除可能存在的 ACME 域名记录
     elif [[ ! -f "$CFG/certs/server.crt" ]]; then
-        gen_self_cert "$sni"
+        gen_self_cert "$sni" || return 1
         echo "$sni" > "$CFG/self_cert_sni"
     fi
     return 0
@@ -5842,7 +5845,9 @@ gen_anytls_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}AnyTLS${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=1#${name}"
+    local insecure=1
+    _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni" && insecure=0
+    printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=${insecure}#${name}"
 }
 
 gen_naive_link() {
@@ -6180,16 +6185,12 @@ _issue_cert_dns() {
     # 设置环境变量并申请证书
     eval "export $dns_env"
     
-    local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt"
     
-    if "$acme_sh" --issue -d "$domain" --dns "$dns_api" --force 2>&1 | tee /tmp/acme_dns.log | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    if (set -o pipefail; "$acme_sh" --issue -d "$domain" --dns "$dns_api" --force 2>&1 | tee /tmp/acme_dns.log); then
         echo ""
         _ok "证书申请成功，安装证书..."
         
-        "$acme_sh" --install-cert -d "$domain" \
-            --key-file       "$cert_dir/server.key"  \
-            --fullchain-file "$cert_dir/server.crt" \
-            --reloadcmd      "$reload_cmd" >/dev/null 2>&1
+        _install_acme_cert "$domain" "$acme_sh" "$(_existing_acme_variant "$domain")" || return 1
         
         # 保存域名
         echo "$domain" > "$CFG/cert_domain"
@@ -6199,7 +6200,7 @@ _issue_cert_dns() {
         # 读取自定义 nginx 端口
         local custom_port=""
         [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-        create_fake_website "$domain" "$protocol" "$custom_port"
+        [[ "$protocol" != "anytls" ]] && create_fake_website "$domain" "$protocol" "$custom_port"
         
         _ok "证书已配置到 $cert_dir"
         diagnose_certificate "$domain"
@@ -6259,19 +6260,17 @@ _issue_cert_dns_manual() {
     _info "验证 DNS 记录..."
     
     # 完成验证
-    if "$acme_sh" --renew -d "$domain" --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | grep -q "Cert success"; then
+    if "$acme_sh" --renew -d "$domain" --yes-I-know-dns-manual-mode-enough-go-ahead-please --force; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
-        "$acme_sh" --install-cert -d "$domain" \
-            --key-file       "$cert_dir/server.key"  \
-            --fullchain-file "$cert_dir/server.crt" >/dev/null 2>&1
+        _install_acme_cert "$domain" "$acme_sh" "$(_existing_acme_variant "$domain")" || return 1
         
         echo "$domain" > "$CFG/cert_domain"
         
         local custom_port=""
         [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-        create_fake_website "$domain" "$protocol" "$custom_port"
+        [[ "$protocol" != "anytls" ]] && create_fake_website "$domain" "$protocol" "$custom_port"
         
         _ok "证书已配置到 $cert_dir"
         echo ""
@@ -6279,6 +6278,168 @@ _issue_cert_dns_manual() {
         return 0
     else
         _err "DNS 验证失败，请检查 TXT 记录是否正确"
+        return 1
+    fi
+}
+
+# 校验证书的有效期、SAN、密钥及系统信任链；只接受完整的 CA 证书链。
+_valid_trusted_cert_pair() {
+    local cert="$1" key="$2" domain="${3:-}" ca_bundle=""
+    [[ -s "$cert" && -s "$key" ]] || return 1
+    openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+    cmp -s <(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null) \
+           <(openssl pkey -in "$key" -pubout 2>/dev/null) || return 1
+    [[ $(grep -c '^-----BEGIN CERTIFICATE-----' "$cert") -ge 2 ]] || return 1
+    openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:' || return 1
+    if [[ -n "$domain" ]]; then
+        openssl x509 -in "$cert" -noout -checkhost "$domain" 2>/dev/null |
+            grep -q 'does match certificate' || return 1
+    fi
+    for ca_bundle in "$CERT_CA_BUNDLE" /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+        [[ -s "$ca_bundle" ]] || continue
+        openssl verify -purpose sslserver -CAfile "$ca_bundle" -untrusted "$cert" "$cert" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+_valid_self_cert_pair() {
+    local cert="$1" key="$2" subject issuer
+    [[ -s "$cert" && -s "$key" ]] || return 1
+    openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+    cmp -s <(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null) \
+           <(openssl pkey -in "$key" -pubout 2>/dev/null) || return 1
+    subject=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null)
+    issuer=$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null)
+    [[ "${subject#subject=}" == "${issuer#issuer=}" ]]
+}
+
+_reload_cert_services() {
+    local service
+    for service in vless-singbox vless-reality; do
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$service"; then
+            systemctl restart "$service" || return 1
+        elif command -v rc-service >/dev/null 2>&1 && rc-service "$service" status >/dev/null 2>&1; then
+            rc-service "$service" restart || return 1
+        fi
+    done
+}
+
+# acme.sh 只写入暂存文件；通过一个目录软链接切换整组证书/私钥。
+deploy_acme_certificate() {
+    local domain="$1" cert_dir="$CFG/certs" next old_target="" backup="" tmp=""
+    [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+    local staged_cert="$cert_dir/.acme-$domain.crt"
+    local staged_key="$cert_dir/.acme-$domain.key"
+    _valid_trusted_cert_pair "$staged_cert" "$staged_key" "$domain" || {
+        _err "ACME 暂存证书无效（有效期、SAN、私钥或完整信任链检查失败）"
+        return 1
+    }
+    if _valid_trusted_cert_pair "$cert_dir/server.crt" "$cert_dir/server.key"; then
+        _valid_trusted_cert_pair "$cert_dir/server.crt" "$cert_dir/server.key" "$domain" || {
+            _err "现有有效证书属于其他域名，拒绝覆盖"
+            return 1
+        }
+        if cmp -s "$staged_cert" "$cert_dir/server.crt" && cmp -s "$staged_key" "$cert_dir/server.key"; then
+            printf '%s\n' "$domain" > "$CFG/cert_domain"
+            return 0
+        fi
+    fi
+    mkdir -p "$cert_dir/releases" "$cert_dir/backups" || return 1
+    chmod 700 "$cert_dir" "$cert_dir/releases" "$cert_dir/backups"
+    next=$(mktemp -d "$cert_dir/releases/.pending.XXXXXXXX") || return 1
+    install -m 644 "$staged_cert" "$next/server.crt" &&
+        install -m 600 "$staged_key" "$next/server.key" &&
+        _valid_trusted_cert_pair "$next/server.crt" "$next/server.key" "$domain" || {
+            rm -rf "$next"
+            return 1
+        }
+    if [[ -e "$cert_dir/server.crt" || -e "$cert_dir/server.key" ]]; then
+        [[ -e "$cert_dir/server.crt" && -e "$cert_dir/server.key" ]] || {
+            _err "现有证书/私钥不完整，拒绝覆盖；请先修复"
+            rm -rf "$next"
+            return 1
+        }
+        backup=$(mktemp -d "$cert_dir/backups/$(date +%Y%m%d-%H%M%S).XXXXXXXX") || return 1
+        cp -L "$cert_dir/server.crt" "$backup/server.crt" &&
+            cp -L "$cert_dir/server.key" "$backup/server.key" || return 1
+        chmod 600 "$backup/server.key"
+        chmod 644 "$backup/server.crt"
+        if [[ "$(readlink "$cert_dir/server.crt")" != "current/server.crt" ||
+              "$(readlink "$cert_dir/server.key")" != "current/server.key" ]]; then
+            tmp=$(mktemp -d "$cert_dir/releases/.previous.XXXXXXXX") || return 1
+            cp "$backup/server.crt" "$tmp/server.crt" && cp "$backup/server.key" "$tmp/server.key" || return 1
+            chmod 600 "$tmp/server.key"
+            ln -s "releases/$(basename "$tmp")" "$cert_dir/.current.next.$$" &&
+                mv -Tf "$cert_dir/.current.next.$$" "$cert_dir/current" || return 1
+            ln -s current/server.crt "$cert_dir/.server.crt.next.$$" &&
+                mv -Tf "$cert_dir/.server.crt.next.$$" "$cert_dir/server.crt" || return 1
+            ln -s current/server.key "$cert_dir/.server.key.next.$$" &&
+                mv -Tf "$cert_dir/.server.key.next.$$" "$cert_dir/server.key" || return 1
+        fi
+    fi
+    [[ -L "$cert_dir/current" ]] && old_target=$(readlink "$cert_dir/current")
+    ln -s "releases/$(basename "$next")" "$cert_dir/.current.next.$$" &&
+        mv -Tf "$cert_dir/.current.next.$$" "$cert_dir/current" || return 1
+    if [[ ! -e "$cert_dir/server.crt" ]]; then
+        ln -s current/server.crt "$cert_dir/server.crt" || return 1
+        ln -s current/server.key "$cert_dir/server.key" || return 1
+    fi
+    if ! _reload_cert_services; then
+        if [[ -n "$old_target" ]]; then
+            ln -s "$old_target" "$cert_dir/.current.rollback.$$" &&
+                mv -Tf "$cert_dir/.current.rollback.$$" "$cert_dir/current"
+            _reload_cert_services || true
+        fi
+        _err "服务重启失败，已恢复旧证书；备份位于 $backup"
+        return 1
+    fi
+    printf '%s\n' "$domain" > "$CFG/cert_domain"
+    _ok "正式证书已部署；备份位于 $backup"
+}
+
+_install_acme_cert() {
+    local domain="$1" acme_sh="$2" variant="$3" cert_dir="$CFG/certs"
+    [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+    local args=()
+    [[ "$variant" == "ecc" ]] && args+=(--ecc)
+    mkdir -p "$cert_dir" || return 1
+    chmod 700 "$cert_dir"
+    (umask 077; touch "$cert_dir/.acme-$domain.key" "$cert_dir/.acme-$domain.crt") || return 1
+    chmod 600 "$cert_dir/.acme-$domain.key" "$cert_dir/.acme-$domain.crt"
+    # Persist a self-contained hook before install-cert: first install may not yet
+    # have a service unit or an updated /usr/local/bin/vless-server.sh.
+    local hook_tmp
+    hook_tmp=$(mktemp "$CFG/.cert-deploy.XXXXXXXX") || return 1
+    {
+        printf '#!/bin/bash\nCFG=%q\n' "$CFG"
+        printf '_err() { printf "%%s\\n" "$*" >&2; }\n_ok() { :; }\n'
+        declare -f _valid_trusted_cert_pair _reload_cert_services deploy_acme_certificate
+        printf 'deploy_acme_certificate "$1"\n'
+    } > "$hook_tmp"
+    chmod 700 "$hook_tmp" && mv -f "$hook_tmp" "$CFG/cert-deploy.sh" || return 1
+    local reload_cmd
+    printf -v reload_cmd 'bash %q %q' "$CFG/cert-deploy.sh" "$domain"
+    "$acme_sh" --install-cert -d "$domain" "${args[@]}" \
+        --key-file "$cert_dir/.acme-$domain.key" \
+        --fullchain-file "$cert_dir/.acme-$domain.crt" \
+        --reloadcmd "$reload_cmd" >/dev/null 2>&1 || {
+            _err "acme.sh --install-cert 失败"
+            return 1
+        }
+    chmod 600 "$cert_dir/.acme-$domain.key"
+    chmod 644 "$cert_dir/.acme-$domain.crt"
+    deploy_acme_certificate "$domain"
+}
+
+_existing_acme_variant() {
+    local domain="$1" root="$HOME/.acme.sh"
+    if _valid_trusted_cert_pair "$root/${domain}_ecc/fullchain.cer" "$root/${domain}_ecc/$domain.key" "$domain"; then
+        echo ecc
+    elif _valid_trusted_cert_pair "$root/$domain/fullchain.cer" "$root/$domain/$domain.key" "$domain"; then
+        echo rsa
+    else
         return 1
     fi
 }
@@ -6291,30 +6452,29 @@ get_acme_cert() {
     local cert_dir="$CFG/certs"
     mkdir -p "$cert_dir"
     
-    # 检查是否已有相同域名的证书
-    if [[ -f "$CFG/cert_domain" ]]; then
-        local existing_domain=$(cat "$CFG/cert_domain")
-        if [[ "$existing_domain" == "$domain" && -f "$cert_dir/server.crt" && -f "$cert_dir/server.key" ]]; then
-            _ok "检测到相同域名的现有证书，跳过申请"
-            # 检查证书是否仍然有效
-            if openssl x509 -in "$cert_dir/server.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
-                _ok "现有证书仍然有效（30天以上）"
-                
-                # 读取自定义 nginx 端口（如果有）
-                local custom_port=""
-                [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-                
-                # 确保Web服务器也启动（复用证书时也需要）
-                create_fake_website "$domain" "$protocol" "$custom_port"
-                
-                diagnose_certificate "$domain"
-                return 0
-            else
-                _warn "现有证书即将过期，重新申请..."
-            fi
+    if _valid_trusted_cert_pair "$cert_dir/server.crt" "$cert_dir/server.key" "$domain"; then
+        echo "$domain" > "$CFG/cert_domain"
+        _ok "复用有效正式证书: $domain"
+        if [[ "$protocol" != "anytls" ]]; then
+            local custom_port=""
+            [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
+            create_fake_website "$domain" "$protocol" "$custom_port"
+            diagnose_certificate "$domain"
         fi
+        return 0
     fi
-    
+    local variant
+    if variant=$(_existing_acme_variant "$domain"); then
+        _install_acme_cert "$domain" "$HOME/.acme.sh/acme.sh" "$variant" || return 1
+        if [[ "$protocol" != "anytls" ]]; then
+            local custom_port=""
+            [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
+            create_fake_website "$domain" "$protocol" "$custom_port"
+            diagnose_certificate "$domain"
+        fi
+        return 0
+    fi
+
     # 先检查域名解析 (快速验证)
     _info "检查域名解析..."
     if ! check_domain_dns "$domain"; then
@@ -6330,7 +6490,7 @@ get_acme_cert() {
         case "$choice" in
             1)
                 _warn "将使用自签证书"
-                return 1  # 返回失败，让调用方使用自签证书
+                return 3  # 明确选择自签名模式
                 ;;
             2)
                 return 2  # 返回特殊值，表示需要重新输入域名
@@ -6403,21 +6563,17 @@ get_acme_cert() {
     [[ -z "$server_ip" ]] && server_ip=$(get_ipv6)
     
     # 构建 reloadcmd（兼容 systemd 和 OpenRC）
-    local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt; chown root:root $cert_dir/server.key $cert_dir/server.crt; if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-singbox 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-singbox restart 2>/dev/null || true; fi"
     
     # 使用 standalone 模式申请证书，显示实时进度
     local acme_log="/tmp/acme_output.log"
     
     # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
-    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    if (set -o pipefail; "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log"); then
         echo ""
         _ok "证书申请成功，安装证书..."
         
         # 安装证书到指定目录，并设置权限和自动重启服务
-        "$acme_sh" --install-cert -d "$domain" \
-            --key-file       "$cert_dir/server.key"  \
-            --fullchain-file "$cert_dir/server.crt" \
-            --reloadcmd      "$reload_cmd" >/dev/null 2>&1
+        _install_acme_cert "$domain" "$acme_sh" "$(_existing_acme_variant "$domain")" || return 1
         
         rm -f "$acme_log"
         
@@ -6434,7 +6590,7 @@ get_acme_cert() {
         [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
         
         # 创建简单的伪装网页
-        create_fake_website "$domain" "$protocol" "$custom_port"
+        [[ "$protocol" != "anytls" ]] && create_fake_website "$domain" "$protocol" "$custom_port"
         
         # 验证证书文件
         if [[ -f "$cert_dir/server.crt" && -f "$cert_dir/server.key" ]]; then
@@ -6494,7 +6650,7 @@ get_acme_cert() {
             3)
                 # 自签名证书
                 _warn "使用自签名证书模式..."
-                return 1
+                return 3
                 ;;
             *)
                 # 取消
@@ -6555,7 +6711,7 @@ setup_cert_and_nginx() {
                 
                 if [[ "$self_cert_choice" != "2" ]]; then
                     # 用户选择申请真实证书，清除旧证书，走正常申请流程
-                    rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
+                    # 保留共享证书，替换仅在验证成功后进行。
                     CERT_DOMAIN=""
                     # 继续往下走到证书申请流程
                 else
@@ -6585,7 +6741,7 @@ setup_cert_and_nginx() {
                     if [[ "$reality_cert_choice" == "2" ]]; then
                         # 用户选择无域名模式，清除证书域名变量和旧证书
                         CERT_DOMAIN=""
-                        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
+                        # 保留共享证书，替换仅在验证成功后进行。
                         _info "将使用随机 SNI (无域名模式)"
                         return 0
                     fi
@@ -6891,17 +7047,15 @@ ask_cert_config() {
     local default_sni="${1:-bing.com}"
     local protocol="${2:-unknown}"
     
-    # 检查是否已有 ACME 证书，如果有则直接复用
-    if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
-        local existing_domain=$(cat "$CFG/cert_domain")
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]]; then
-            _ok "检测到现有 ACME 证书: $existing_domain，自动复用" >&2
-            echo "$existing_domain"
-            return 0
-        fi
+    local existing_domain=""
+    [[ -f "$CFG/cert_domain" ]] && existing_domain=$(cat "$CFG/cert_domain")
+    if [[ -n "$existing_domain" ]] &&
+       _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$existing_domain"; then
+        _ok "复用有效正式证书: $existing_domain" >&2
+        echo "$existing_domain"
+        return 0
     fi
-    
+
     # 所有提示信息输出到 stderr，避免污染返回值
     echo "" >&2
     _line >&2
@@ -6940,8 +7094,12 @@ ask_cert_config() {
             read -rp "  请输入你的域名: " domain
             
             if [[ -z "$domain" ]]; then
+                if [[ "$protocol" == "anytls" ]]; then
+                    _warn "已选择正式证书模式，请输入域名" >&2
+                    continue
+                fi
                 _warn "域名不能为空，使用自签证书" >&2
-                gen_self_cert "$default_sni" >&2
+                gen_self_cert "$default_sni" >&2 || return 1
                 domain=""
                 break
             else
@@ -6963,9 +7121,17 @@ ask_cert_config() {
                 elif [[ $cert_result -eq 2 ]]; then
                     # 需要重新输入域名，继续循环
                     continue
+                elif [[ $cert_result -eq 3 ]]; then
+                    gen_self_cert "$default_sni" >&2 || return 1
+                    domain=""
+                    break
                 else
-                    # ACME 失败，使用自签证书，返回空字符串
-                    gen_self_cert "$default_sni" >&2
+                    # AnyTLS 申请正式证书失败时停止，不静默回退。
+                    if [[ "$protocol" == "anytls" ]]; then
+                        _err "正式证书申请或部署失败；原证书保持不变" >&2
+                        return 1
+                    fi
+                    gen_self_cert "$default_sni" >&2 || return 1
                     domain=""
                     break
                 fi
@@ -6973,7 +7139,7 @@ ask_cert_config() {
         done
     else
         # 无域名模式：使用自签证书，返回空字符串表示没有真实域名
-        gen_self_cert "$default_sni" >&2
+        gen_self_cert "$default_sni" >&2 || return 1
         domain=""
     fi
     
@@ -9594,7 +9760,15 @@ generate_singbox_config() {
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
                 local cert_path="$CFG/certs/server.crt"
                 local key_path="$CFG/certs/server.key"
-                [[ ! -f "$cert_path" || ! -f "$key_path" ]] && continue
+                if ! _valid_trusted_cert_pair "$cert_path" "$key_path" "$sni"; then
+                    local variant
+                    if variant=$(_existing_acme_variant "$sni"); then
+                        _install_acme_cert "$sni" "$HOME/.acme.sh/acme.sh" "$variant" || return 1
+                    elif ! _valid_self_cert_pair "$cert_path" "$key_path"; then
+                        _err "AnyTLS 缺少有效证书/私钥，未重建 singbox.json"
+                        return 1
+                    fi
+                fi
 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
@@ -10104,28 +10278,32 @@ gen_self_cert() {
     local domain="${1:-localhost}"
     mkdir -p "$CFG/certs"
     
-    # 检查是否应该保护现有证书
-    if [[ -f "$CFG/certs/server.crt" ]]; then
-        # 检查是否为 CA 签发的证书（真实证书不覆盖）
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign) ]]; then
-            _ok "检测到 CA 证书，跳过"
+    if [[ -e "$CFG/certs/server.crt" || -e "$CFG/certs/server.key" ]]; then
+        if _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" ||
+           _valid_self_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key"; then
+            _ok "保留现有证书"
             return 0
         fi
-        # 检查现有自签证书的 CN 是否匹配
-        local current_cn=$(openssl x509 -in "$CFG/certs/server.crt" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')
-        if [[ "$current_cn" == "$domain" ]]; then
-            _ok "自签证书 CN 匹配，跳过"
-            return 0
-        fi
+        _err "现有证书不可用，拒绝自动覆盖；请申请或安装有效证书"
+        return 1
     fi
-    
-    rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
-    _info "生成自签名证书..."
-    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-        -keyout "$CFG/certs/server.key" -out "$CFG/certs/server.crt" \
-        -subj "/CN=$domain" -days 36500 2>/dev/null
-    chmod 600 "$CFG/certs/server.key"
+    [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+    local pending
+    pending=$(mktemp -d "$CFG/certs/.self.XXXXXXXX") || return 1
+    chmod 700 "$CFG/certs"
+    _warn "使用自签名证书模式，客户端需要跳过证书验证"
+    if ! openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+        -keyout "$pending/server.key" -out "$pending/server.crt" \
+        -subj "/CN=$domain" -addext "subjectAltName=DNS:$domain" -days 365 2>/dev/null; then
+        rm -rf "$pending"
+        return 1
+    fi
+    chmod 600 "$pending/server.key"
+    chmod 644 "$pending/server.crt"
+    ln -s "$(basename "$pending")" "$CFG/certs/current" &&
+        ln -s current/server.crt "$CFG/certs/server.crt" &&
+        ln -s current/server.key "$CFG/certs/server.key"
+
 }
 
 
@@ -10437,8 +10615,21 @@ gen_anytls_server_config() {
     local password="$1" port="$2" sni="${3:-bing.com}"
     mkdir -p "$CFG"
 
-    # AnyTLS 在 Sing-box 中需要 TLS 配置；若当前没有证书则自动生成自签证书
-    [[ ! -f "$CFG/certs/server.crt" || ! -f "$CFG/certs/server.key" ]] && gen_self_cert "$sni"
+    # 安装入口已明确选定正式证书或自签名模式；配置重建不得覆盖证书。
+    if ! _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni"; then
+        local variant
+        if variant=$(_existing_acme_variant "$sni"); then
+            _install_acme_cert "$sni" "$HOME/.acme.sh/acme.sh" "$variant" || return 1
+        elif _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key"; then
+            _err "现有正式证书与 AnyTLS SNI 不匹配"
+            return 1
+        elif _valid_self_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key"; then
+            _warn "保留自签名证书模式"
+        else
+            _err "AnyTLS 证书缺失或无效；请重新选择证书模式"
+            return 1
+        fi
+    fi
 
     register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")"
     _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni" \
@@ -17748,7 +17939,7 @@ show_single_protocol_info() {
             echo -e "  SNI: ${G}$sni${NC}"
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-AnyTLS = anytls, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-AnyTLS = anytls, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=$(_valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni" && echo false || echo true)${NC}"
             ;;
         naive)
             local domain=$(echo "$cfg" | jq -r '.domain // empty')
@@ -18024,6 +18215,11 @@ show_single_protocol_info() {
             echo ""
             echo -e "  ${Y}⚠ 使用自签名证书，客户端需开启「跳过证书验证」或「允许不安全连接」${NC}"
         fi
+    fi
+    if [[ "$protocol" == "anytls" ]] &&
+       ! _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni"; then
+        echo ""
+        echo -e "  ${Y}⚠ AnyTLS 当前使用自签名证书，客户端需开启跳过证书验证${NC}"
     fi
     
     # Hysteria2 端口跳跃提示
@@ -19308,7 +19504,7 @@ do_install_server() {
                             return 0
                         fi
                         # 清除失败的配置，准备重试
-                        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
+                        # 保留共享证书，替换仅在验证成功后进行。
                     fi
                 done
                 
@@ -20094,9 +20290,10 @@ do_install_server() {
             ;;
         anytls)
             local password=$(ask_password 16 "AnyTLS密码")
-            
-            # AnyTLS不需要证书申请，直接询问SNI配置
-            local final_sni=$(ask_sni_config "$(gen_sni)" "")
+            local default_sni=$(gen_sni)
+            local cert_domain
+            cert_domain=$(ask_cert_config "$default_sni" "anytls") || return 1
+            local final_sni="${cert_domain:-$default_sni}"
             
             echo ""
             _line
@@ -20111,7 +20308,7 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_anytls_server_config "$password" "$port" "$final_sni"
+            gen_anytls_server_config "$password" "$port" "$final_sni" || return 1
             ;;
         naive)
             local username=$(ask_password 8 "NaïveProxy用户名")
@@ -20796,13 +20993,16 @@ parse_anytls_link() {
     local port="${parsed##*|}"
     
     local params="${content#*\?}"
-    local sni=""
+    local sni="" insecure="false"
     IFS='&' read -ra PARAMS <<< "$params"
     for param in "${PARAMS[@]}"; do
         local key="${param%%=*}"
         local value="${param#*=}"
         case "$key" in
             sni) sni="$value" ;;
+            allowInsecure|allow_insecure|insecure)
+                [[ "$value" == "1" || "$value" == "true" ]] && insecure="true"
+                ;;
         esac
     done
     
@@ -20821,7 +21021,8 @@ parse_anytls_link() {
         --argjson port "$port" \
         --arg password "$password" \
         --arg sni "$sni" \
-        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,insecure:$insecure}'
 }
 
 # 解析任意分享链接
@@ -21190,6 +21391,7 @@ EOF
         anytls)
             local password=$(echo "$json" | jq -r '.password')
             local sni=$(echo "$json" | jq -r '.sni')
+            local insecure=$(echo "$json" | jq -r '.insecure // false')
             cat << EOF
   - name: "$name"
     type: anytls
@@ -21197,7 +21399,7 @@ EOF
     port: $port
     password: $password
     sni: $sni
-    skip-cert-verify: true
+    skip-cert-verify: $insecure
 EOF
             ;;
     esac
@@ -21249,7 +21451,8 @@ external_link_to_surge() {
         anytls)
             local password=$(echo "$json" | jq -r '.password')
             local sni=$(echo "$json" | jq -r '.sni')
-            echo "$name = anytls, $server, $port, password=$password, sni=$sni, skip-cert-verify=true"
+            local insecure=$(echo "$json" | jq -r '.insecure // false')
+            echo "$name = anytls, $server, $port, password=$password, sni=$sni, skip-cert-verify=$insecure"
             ;;
     esac
 }
@@ -21908,13 +22111,15 @@ gen_clash_sub() {
     skip-cert-verify: true"
                 ;;
             anytls)
+                local insecure=true
+                _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni" && insecure=false
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
     type: anytls
     server: \"$server_ip\"
     port: $port
     password: $password
     sni: $sni
-    skip-cert-verify: true"
+    skip-cert-verify: $insecure"
                 ;;
             esac
             
@@ -22030,7 +22235,9 @@ gen_surge_sub() {
                     [[ -n "$server_ip" ]] && proxy="$name = tuic, $server_ip, $port, uuid=$uuid, password=$password, sni=$sni, skip-cert-verify=true, alpn=h3"
                     ;;
                 anytls)
-                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    local insecure=true
+                    _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni" && insecure=false
+                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=$insecure"
                     ;;
                 snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
                     # Snell 和 Snell+ShadowTLS 都使用相同的 Surge 配置格式
@@ -26675,6 +26882,10 @@ main_menu() {
 
 # 命令行参数处理
 case "${1:-}" in
+    --deploy-cert)
+        deploy_acme_certificate "${2:-}"
+        exit $?
+        ;;
     --sync-traffic)
         # 静默模式：用于定时任务
         init_db
