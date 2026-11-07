@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.4 [服务端]
+#  多协议代理一键部署脚本 v3.5.5 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.4"
+readonly VERSION="3.5.5"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/supernene/vio"
 readonly SCRIPT_REPO="supernene/vio"
@@ -9046,6 +9046,8 @@ _build_singbox_geosite_ruleset() {
     local tag="$1"
     local source_path=$(_singbox_ruleset_source_path "$tag")
     local output_path=$(_singbox_ruleset_path "$tag")
+    local source_tmp="$CFG/ruleset-src/.$tag.$$.json"
+    local output_tmp="$CFG/ruleset/.$tag.$$.srs"
     local roots=""
 
     case "$tag" in
@@ -9056,7 +9058,7 @@ _build_singbox_geosite_ruleset() {
 
     mkdir -p "$CFG/ruleset" "$CFG/ruleset-src"
 
-    python3 - "$source_path" $roots <<'PY'
+    python3 - "$source_tmp" $roots <<'PY'
 import json, sys, urllib.request
 from pathlib import Path
 
@@ -9140,13 +9142,20 @@ out = {'version': 3, 'rules': [rule] if rule else []}
 out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2))
 PY
 
-    sing-box rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
+    if ! sing-box rule-set compile "$source_tmp" -o "$output_tmp" >/dev/null 2>&1 || [[ ! -s "$output_tmp" ]]; then
+        rm -f "$source_tmp" "$output_tmp"
+        return 1
+    fi
+    mv -f "$source_tmp" "$source_path" && mv -f "$output_tmp" "$output_path" || return 1
+    touch "$CFG/ruleset/.managed-$tag"
 }
 
 _build_singbox_geoip_ruleset() {
     local tag="$1"
     local source_path=$(_singbox_ruleset_source_path "$tag")
     local output_path=$(_singbox_ruleset_path "$tag")
+    local source_tmp="$CFG/ruleset-src/.$tag.$$.json"
+    local output_tmp="$CFG/ruleset/.$tag.$$.srs"
     local name=""
 
     case "$tag" in
@@ -9156,7 +9165,7 @@ _build_singbox_geoip_ruleset() {
 
     mkdir -p "$CFG/ruleset" "$CFG/ruleset-src"
 
-    python3 - "$source_path" "$name" <<'PY'
+    python3 - "$source_tmp" "$name" <<'PY'
 import json, sys, urllib.request
 from pathlib import Path
 
@@ -9185,7 +9194,12 @@ out = {'version': 3, 'rules': [{'ip_cidr': ips}] if ips else []}
 out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2))
 PY
 
-    sing-box rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
+    if ! sing-box rule-set compile "$source_tmp" -o "$output_tmp" >/dev/null 2>&1 || [[ ! -s "$output_tmp" ]]; then
+        rm -f "$source_tmp" "$output_tmp"
+        return 1
+    fi
+    mv -f "$source_tmp" "$source_path" && mv -f "$output_tmp" "$output_path" || return 1
+    touch "$CFG/ruleset/.managed-$tag"
 }
 
 _build_singbox_ruleset() {
@@ -9232,12 +9246,20 @@ _ensure_singbox_rulesets_from_routing_rules() {
     local tag
     for tag in $tags; do
         local path=$(_singbox_ruleset_path "$tag")
+        local marker="$CFG/ruleset/.managed-$tag"
+        [[ -s "$path" && -s "$(_singbox_ruleset_source_path "$tag")" && ! -e "$marker" ]] && touch "$marker"
         if [[ ! -s "$path" ]]; then
             _info "生成规则集: $tag"
             _build_singbox_ruleset "$tag" || {
-                _err "生成 Sing-box 规则集失败: $tag"
+                _err "Sing-box 规则集缺失且下载/编译失败: $tag；原配置保持不变"
                 return 1
             }
+        elif [[ -e "$marker" ]]; then
+            local modified=$(_get_file_mtime "$marker")
+            if [[ -n "$modified" ]] && (( $(date +%s) - modified > 604800 )); then
+                _info "更新规则集缓存: $tag"
+                _build_singbox_ruleset "$tag" || _warn "规则集更新失败，继续使用本地缓存: $tag"
+            fi
         fi
     done
 }
@@ -9256,6 +9278,46 @@ _build_singbox_ruleset_defs() {
         defs=$(echo "$defs" | jq --arg tag "$tag" --arg path "$path" '. + [{type: "local", tag: $tag, format: "binary", path: $path}]')
     done
     echo "$defs"
+}
+
+# 保留用户手工加入的 sniff / 自定义动作及本地规则集，同时替换上次脚本生成的规则。
+_merge_singbox_manual_routes() {
+    local config="$1" previous='{"rules":[],"rule_set":[]}'
+    [[ -s "$CFG/singbox.json" ]] || { printf '%s\n' "$config"; return 0; }
+    jq empty "$CFG/singbox.json" >/dev/null 2>&1 || { printf '%s\n' "$config"; return 0; }
+    if [[ -s "$CFG/singbox-managed-rules.json" ]]; then
+        previous=$(cat "$CFG/singbox-managed-rules.json")
+    fi
+    jq -n --argjson next "$config" --argjson previous "$previous" \
+        --slurpfile old "$CFG/singbox.json" '
+        $old[0] as $before |
+        ($next.route.rules // []) as $new_rules |
+        ($next.route.rule_set // []) as $new_sets |
+        ([$new_rules[] | .rule_set[]?] | unique) as $new_tags |
+        ([$previous.rule_set[]? | .tag] | unique) as $old_tags |
+        [$before.route.rules[]? | . as $r |
+            select(($previous.rules | index($r)) == null) |
+            select((($r.rule_set // [] | any(. as $tag | $new_tags | index($tag) != null))
+                and (($r.action // "") == "reject" or ($r.outbound // "") == "block")
+                and (($r | keys - ["action","outbound","rule_set"]) | length == 0)) | not)
+        ] as $manual |
+        ([$manual[] | .rule_set[]?] | unique) as $manual_tags |
+        [$before.route.rule_set[]? | . as $set |
+            select(($new_tags | index($set.tag)) == null and
+                   (($old_tags | index($set.tag)) == null or ($manual_tags | index($set.tag)) != null))
+        ] as $manual_sets |
+        ([$manual[] | .outbound? // empty] | unique) as $manual_outbound_tags |
+        ([$next.outbounds[]?.tag] | unique) as $next_outbound_tags |
+        [$before.outbounds[]? | . as $out |
+            select(($manual_outbound_tags | index($out.tag)) != null and
+                   ($next_outbound_tags | index($out.tag)) == null)
+        ] as $manual_outbounds |
+        $next |
+        .outbounds = ((.outbounds // []) + $manual_outbounds) |
+        .route = (($before.route // {}) + (.route // {})) |
+        .route.rules = (($manual + $new_rules) |
+            reduce .[] as $rule ([]; if index($rule) then . else . + [$rule] end)) |
+        .route.rule_set = ($manual_sets + $new_sets)'
 }
 
 # 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
@@ -9525,13 +9587,16 @@ generate_singbox_config() {
             done < <(echo "$balancer_groups" | jq -c '.[]')
         fi
 
-        routing_rules=$(gen_singbox_routing_rules)
+        routing_rules=$(gen_singbox_routing_rules) || {
+            _err "Sing-box 分流规则转换失败，原配置保持不变"
+            return 1
+        }
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             if [[ "$warp_has_endpoint" == "true" ]]; then
                 routing_rules=$(echo "$routing_rules" | jq 'map(if ((.outbound // "") | startswith("warp")) then .outbound = "warp" else . end)')
             fi
             _ensure_singbox_rulesets_from_routing_rules "$routing_rules" || return 1
-            singbox_ruleset_defs=$(_build_singbox_ruleset_defs "$routing_rules")
+            singbox_ruleset_defs=$(_build_singbox_ruleset_defs "$routing_rules") || return 1
             has_routing=true
         fi
         
@@ -9949,16 +10014,39 @@ generate_singbox_config() {
             }')
     fi
 
-    # 合并配置并写入文件
-    echo "$base_config" | jq \
-        --argjson ibs "$inbounds" \
-        '.inbounds = $ibs' > "$CFG/singbox.json"
-    
-    # 验证配置
-    if ! jq empty "$CFG/singbox.json" 2>/dev/null; then
+    # 先构建并验证临时文件，下载或语法失败时保留当前运行配置。
+    base_config=$(echo "$base_config" | jq --argjson ibs "$inbounds" '.inbounds = $ibs') || return 1
+    if echo "$base_config" | jq -e 'any(.route.rules[]?; any(.rule_set[]?; startswith("geosite-")))' >/dev/null; then
+        base_config=$(echo "$base_config" | jq '.route.rules = ([{action:"sniff"}] + .route.rules)') || return 1
+    fi
+    # 1.14 已移除旧的 dial.domain_strategy；将现有出口策略映射到本地解析器。
+    base_config=$(echo "$base_config" | jq '
+        if any(.outbounds[]?; .domain_strategy != null) then
+            .dns.servers = ((.dns.servers // []) + [{type:"local",tag:"local"}] | unique_by(.tag)) |
+            .outbounds |= map(if .domain_strategy != null then
+                .domain_resolver = {server:"local",strategy:.domain_strategy} | del(.domain_strategy)
+                else . end)
+        else . end') || return 1
+    local managed_rules managed_sets managed_config tmp_config tmp_managed
+    managed_rules=$(echo "$base_config" | jq -c '.route.rules // []') || return 1
+    managed_sets=$(echo "$base_config" | jq -c '.route.rule_set // []') || return 1
+    managed_config=$(jq -n --argjson rules "$managed_rules" --argjson sets "$managed_sets" '{rules:$rules,rule_set:$sets}')
+    base_config=$(_merge_singbox_manual_routes "$base_config") || return 1
+    tmp_config=$(mktemp "$CFG/.singbox.XXXXXXXX.json") || return 1
+    tmp_managed=$(mktemp "$CFG/.singbox-managed.XXXXXXXX.json") || { rm -f "$tmp_config"; return 1; }
+    if ! printf '%s\n' "$base_config" | jq . > "$tmp_config" ||
+       ! printf '%s\n' "$managed_config" | jq . > "$tmp_managed"; then
+        rm -f "$tmp_config" "$tmp_managed"
         _err "Sing-box 配置 JSON 格式错误"
         return 1
     fi
+    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$tmp_config"; then
+        rm -f "$tmp_config" "$tmp_managed"
+        _err "Sing-box 配置校验失败，原运行配置保持不变"
+        return 1
+    fi
+    mv -f "$tmp_config" "$CFG/singbox.json" &&
+        mv -f "$tmp_managed" "$CFG/singbox-managed-rules.json" || return 1
     
     _ok "Sing-box 配置生成成功 ($success_count 个协议)"
     return 0
@@ -12668,9 +12756,11 @@ db_add_routing_rule() {
     # 获取 IP 版本选项 (第4个参数)
     local ip_version="${4:-prefer_ipv4}"
     
-    # 生成规则 ID
-    local rule_id="${rule_type}_$(date +%s)"
-    if [[ "$rule_type" != "custom" ]]; then
+    # 自定义规则使用随机 ID，避免同一秒内添加多条时发生冲突。
+    local rule_id="${5:-}"
+    if [[ -z "$rule_id" && "$rule_type" == "custom" ]]; then
+        rule_id="custom_$(od -An -tx1 -N16 /dev/urandom | tr -d '[:space:]')"
+    elif [[ -z "$rule_id" ]]; then
         if [[ "$rule_type" == "all" ]]; then
             rule_id="all_${ip_version}"
         else
@@ -13446,29 +13536,15 @@ gen_singbox_routing_rules() {
                 *) all_other=$(echo "$all_other" | jq --argjson r "$rule_json" '. + [$r]') ;;
             esac
         elif [[ -n "$domains" ]]; then
-            # 检测是否是 geosite 规则
-            if [[ "$domains" == geosite:* ]]; then
-                # Sing-box 使用 rule_set 格式，需要引用 geosite 规则集
-                local geosite_name="${domains#geosite:}"
+            # geosite/geoip 使用本地 SRS；逗号分隔时每个标签独立转换。
+            if [[ "$domains" == geosite:* || "$domains" == geoip:* ]]; then
+                local rule_sets
+                rule_sets=$(jq -n --arg domains "$domains" '$domains | split(",") | map(gsub("^geosite:";"geosite-") | gsub("^geoip:";"geoip-"))') || return 1
+                echo "$rule_sets" | jq -e 'all(.[]; test("^(geosite|geoip)-[a-zA-Z0-9_!.-]+$"))' >/dev/null || return 1
                 if [[ -n "$ip_family_cidr" ]]; then
-                    result=$(echo "$result" | jq --arg geosite "$geosite_name" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                        '. + [{"rule_set": ["geosite-\($geosite)"], "ip_cidr": [$ip], "outbound": $tag}]')
+                    result=$(echo "$result" | jq --argjson sets "$rule_sets" --arg tag "$tag" --arg ip "$ip_family_cidr" '. + [{rule_set:$sets,ip_cidr:[$ip],outbound:$tag}]')
                 else
-                    result=$(echo "$result" | jq --arg geosite "$geosite_name" --arg tag "$tag" \
-                        '. + [{"rule_set": ["geosite-\($geosite)"], "outbound": $tag}]')
-                fi
-            elif [[ "$domains" =~ ^geoip:[^,]+(,geoip:[^,]+)*$ ]]; then
-                # geoip 规则转换为对应 rule_set
-                local geoip_rule_set
-                geoip_rule_set=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | sed 's/^geoip:/geoip-/' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
-                if [[ -n "$geoip_rule_set" && "$geoip_rule_set" != "[]" && "$geoip_rule_set" != "null" ]] && echo "$geoip_rule_set" | jq empty 2>/dev/null; then
-                    if [[ -n "$ip_family_cidr" ]]; then
-                        result=$(echo "$result" | jq --argjson sets "$geoip_rule_set" --arg tag "$tag" --arg ip "$ip_family_cidr" \
-                            '. + [{"rule_set": $sets, "ip_cidr": [$ip], "outbound": $tag}]')
-                    else
-                        result=$(echo "$result" | jq --argjson sets "$geoip_rule_set" --arg tag "$tag" \
-                            '. + [{"rule_set": $sets, "outbound": $tag}]')
-                    fi
+                    result=$(echo "$result" | jq --argjson sets "$rule_sets" --arg tag "$tag" '. + [{rule_set:$sets,outbound:$tag}]')
                 fi
             else
                 # 分离域名和 IP 地址
@@ -13517,9 +13593,12 @@ gen_singbox_routing_rules() {
                 fi
             fi
         fi
-    done < <(echo "$rules" | jq -c '.[]')
-    
-    result=$(echo "$result" | jq --argjson v6 "$all_ipv6" --argjson v4 "$all_ipv4" --argjson other "$all_other" '. + $v6 + $v4 + $other')
+    done < <(echo "$rules" | jq -c '([.[] | select(.outbound == "direct" and .type != "all")] + [.[] | select(.outbound != "direct" and .type != "all")] + [.[] | select(.type == "all")]) | .[]')
+
+    result=$(echo "$result" | jq --argjson v6 "$all_ipv6" --argjson v4 "$all_ipv4" --argjson other "$all_other" '
+        (. + $v6 + $v4 + $other)
+        | map(if .outbound == "block" then del(.outbound) + {action:"reject"} else . end)
+        | reduce .[] as $rule ([]; if index($rule) then . else . + [$rule] end)')
     [[ "$result" != "[]" ]] && echo "$result"
 }
 
@@ -13857,10 +13936,20 @@ cleanup_legacy_access_restriction_rules() {
 }
 
 disable_access_restriction() {
+    local db_backup
+    db_backup=$(mktemp) || return 1
+    cp "$DB_FILE" "$db_backup" || return 1
     db_del_routing_rule "restrict-cn" "by_type"
     db_del_routing_rule "restrict-btpt" "by_type"
     cleanup_legacy_access_restriction_rules
-    _regenerate_proxy_configs
+    if ! _regenerate_proxy_configs; then
+        cp "$db_backup" "$DB_FILE"
+        _regenerate_proxy_configs >/dev/null 2>&1 || true
+        rm -f "$db_backup"
+        _err "关闭访问限制失败，数据库已恢复"
+        return 1
+    fi
+    rm -f "$db_backup"
     _ok "访问限制已关闭"
     _pause
 }
@@ -13926,43 +14015,13 @@ enable_access_restriction() {
     echo ""
     read -rp "  确认启用? [Y/n]: " confirm
     [[ "$confirm" =~ ^[nN]$ ]] && return 0
+    local db_backup
+    db_backup=$(mktemp) || return 1
+    cp "$DB_FILE" "$db_backup" || return 1
     cleanup_legacy_access_restriction_rules
-    db_add_routing_rule "custom" "block" "geosite:cn" "as_is"
-    python3 - "$DB_FILE" <<'PY2'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1])
-d=json.loads(p.read_text())
-for r in d.get('routing_rules',[]):
-    if r.get('domains')=='geosite:cn' and r.get('outbound')=='block':
-        r['id']='restrict-cn-geosite'
-        break
-p.write_text(json.dumps(d,ensure_ascii=False,indent=2))
-PY2
-    db_add_routing_rule "custom" "block" "geoip:cn" "as_is"
-    python3 - "$DB_FILE" <<'PY2'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1])
-d=json.loads(p.read_text())
-for r in d.get('routing_rules',[]):
-    if r.get('domains')=='geoip:cn' and r.get('outbound')=='block':
-        r['id']='restrict-cn-geoip'
-        break
-p.write_text(json.dumps(d,ensure_ascii=False,indent=2))
-PY2
-    db_add_routing_rule "custom" "block" "geosite:tracker" "as_is"
-    python3 - "$DB_FILE" <<'PY2'
-import json,sys
-from pathlib import Path
-p=Path(sys.argv[1])
-d=json.loads(p.read_text())
-for r in d.get('routing_rules',[]):
-    if r.get('domains')=='geosite:tracker' and r.get('outbound')=='block':
-        r['id']='restrict-btpt-tracker'
-        break
-p.write_text(json.dumps(d,ensure_ascii=False,indent=2))
-PY2
+    db_add_routing_rule "custom" "block" "geosite:cn" "as_is" "restrict-cn-geosite"
+    db_add_routing_rule "custom" "block" "geoip:cn" "as_is" "restrict-cn-geoip"
+    db_add_routing_rule "custom" "block" "geosite:tracker" "as_is" "restrict-btpt-tracker"
 
     if [[ -n "$(get_singbox_protocols 2>/dev/null)" ]]; then
         echo ""
@@ -13970,7 +14029,14 @@ PY2
         _info "若本机首次为 Sing-box 启用访问限制，可能会额外下载并编译规则集"
     fi
 
-    _regenerate_proxy_configs
+    if ! _regenerate_proxy_configs; then
+        cp "$db_backup" "$DB_FILE"
+        _regenerate_proxy_configs >/dev/null 2>&1 || true
+        rm -f "$db_backup"
+        _err "启用访问限制失败，数据库已恢复；请检查规则集下载和 sing-box 日志"
+        return 1
+    fi
+    rm -f "$db_backup"
     _ok "访问限制已启用"
     sleep 1
     return 0
@@ -14268,14 +14334,34 @@ _del_routing_rule() {
 _regenerate_proxy_configs() {
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        generate_xray_config
-        svc restart vless-reality 2>/dev/null
+        generate_xray_config || return 1
+        svc restart vless-reality || return 1
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        generate_singbox_config
-        svc restart vless-singbox 2>/dev/null
+        local config_backup="" managed_backup=""
+        if [[ -f "$CFG/singbox.json" ]]; then
+            config_backup=$(mktemp) || return 1
+            cp "$CFG/singbox.json" "$config_backup" || return 1
+        fi
+        if [[ -f "$CFG/singbox-managed-rules.json" ]]; then
+            managed_backup=$(mktemp) || return 1
+            cp "$CFG/singbox-managed-rules.json" "$managed_backup" || return 1
+        fi
+        if ! generate_singbox_config; then
+            rm -f "$config_backup" "$managed_backup"
+            return 1
+        fi
+        if ! svc restart vless-singbox; then
+            [[ -n "$config_backup" ]] && cp "$config_backup" "$CFG/singbox.json"
+            [[ -n "$managed_backup" ]] && cp "$managed_backup" "$CFG/singbox-managed-rules.json"
+            svc restart vless-singbox || true
+            rm -f "$config_backup" "$managed_backup"
+            _err "Sing-box 重启失败，运行配置已恢复"
+            return 1
+        fi
+        rm -f "$config_backup" "$managed_backup"
     fi
 }
 
