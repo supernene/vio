@@ -6096,7 +6096,7 @@ ensure_acme_account_email() {
             echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" > "$account_conf"
         fi
         
-        if ! ACCOUNT_EMAIL="$ACME_DEFAULT_EMAIL" "$acme_sh" --register-account -m "$ACME_DEFAULT_EMAIL" >/dev/null 2>&1; then
+        if ! ACCOUNT_EMAIL="$ACME_DEFAULT_EMAIL" "$acme_sh" --register-account --server letsencrypt -m "$ACME_DEFAULT_EMAIL" >/dev/null 2>&1; then
             _err "ACME 账户注册失败，请检查网络或稍后重试"
             return 1
         fi
@@ -6186,7 +6186,7 @@ _issue_cert_dns() {
     eval "export $dns_env"
     
     
-    if (set -o pipefail; "$acme_sh" --issue -d "$domain" --dns "$dns_api" --force 2>&1 | tee /tmp/acme_dns.log); then
+    if (set -o pipefail; "$acme_sh" --issue --server letsencrypt -d "$domain" --dns "$dns_api" --force 2>&1 | tee /tmp/acme_dns.log); then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -6229,11 +6229,11 @@ _issue_cert_dns_manual() {
     echo ""
     
     # 获取 DNS 记录
-    local txt_record=$("$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p")
+    local txt_record=$("$acme_sh" --issue --server letsencrypt -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p")
     
     if [[ -z "$txt_record" ]]; then
         # 尝试另一种方式获取
-        "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee /tmp/acme_manual.log
+        "$acme_sh" --issue --server letsencrypt -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee /tmp/acme_manual.log
         txt_record=$(sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p" "/tmp/acme_manual.log" 2>/dev/null)
     fi
     
@@ -6260,7 +6260,7 @@ _issue_cert_dns_manual() {
     _info "验证 DNS 记录..."
     
     # 完成验证
-    if "$acme_sh" --renew -d "$domain" --yes-I-know-dns-manual-mode-enough-go-ahead-please --force; then
+    if "$acme_sh" --renew --server letsencrypt -d "$domain" --yes-I-know-dns-manual-mode-enough-go-ahead-please --force; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -6568,7 +6568,7 @@ get_acme_cert() {
     local acme_log="/tmp/acme_output.log"
     
     # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
-    if (set -o pipefail; "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log"); then
+    if (set -o pipefail; "$acme_sh" --issue --server letsencrypt -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log"); then
         echo ""
         _ok "证书申请成功，安装证书..."
         
