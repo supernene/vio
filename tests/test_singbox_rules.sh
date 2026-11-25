@@ -9,7 +9,8 @@ mkdir -p "$CFG/ruleset" "$CFG/ruleset-src"
 for fn in db_get_routing_rules db_add_routing_rule gen_singbox_routing_rules \
     _singbox_ruleset_path _singbox_ruleset_source_path _list_missing_singbox_rulesets_from_routing_rules \
     _ensure_singbox_rulesets_from_routing_rules _build_singbox_ruleset_defs \
-    _merge_singbox_manual_routes _regenerate_proxy_configs generate_singbox_config; do
+    _merge_singbox_manual_routes _regenerate_proxy_configs generate_singbox_config \
+    _singbox_db_nodes _build_singbox_inbound _apply_singbox_config; do
     awk -v fn="$fn" '$0 == fn "() {" {on=1} on {print} on && $0 == "}" {exit}' \
         "$root/vless-server.sh" >> "$tmp/functions.sh"
 done
@@ -121,30 +122,28 @@ mixed=$(gen_singbox_routing_rules)
 (
     p=ss2022
     _ok() { :; }
-    _ensure_singbox_default_users() { :; }
     _listen_addr() { echo 127.0.0.1; }
-    db_list_protocols() { printf '%s\n' anytls ss2022; }
-    db_get() { jq -c --arg p "$2" '.singbox[$p]' "$DB_FILE"; }
     db_get_warp_mode() { echo disabled; }
     db_get_balancer_groups() { echo '[]'; }
     _valid_trusted_cert_pair() { return 0; }
     _get_singbox_stat_user_mappings() { :; }
     sing-box() { [[ "$1" == check ]]; }
+    svc() { return 1; }
     jq '.singbox = {
         anytls:{port:443,password:"keep-password",sni:"test.example",users:[]},
         ss2022:{port:8443,password:"keep-ss",method:"2022-blake3-aes-128-gcm",users:[]}
     }' "$DB_FILE" > "$tmp/db-next"
     mv "$tmp/db-next" "$DB_FILE"
-    generate_singbox_config || exit 1
+    _apply_singbox_config active || exit 1
     [[ $(jq '.route.rules | map(select(.rule_set)) | length' "$CFG/singbox.json") -gt 0 ]]
     jq -e '.inbounds[] | select(.type=="anytls" and .listen_port==443) | .users[] | select(.name=="anytls-default" and .password=="keep-password")' "$CFG/singbox.json" >/dev/null
     jq '.singbox.anytls.users=[{name:"added",uuid:"new-user-password"}]' "$DB_FILE" > "$tmp/db-next"
     mv "$tmp/db-next" "$DB_FILE"
-    generate_singbox_config || exit 1
+    _apply_singbox_config active || exit 1
     jq -e '.inbounds[] | select(.type=="anytls") | .users[] | select(.name=="anytls-added")' "$CFG/singbox.json" >/dev/null
     jq '.singbox.ss2022.port=9443' "$DB_FILE" > "$tmp/db-next"
     mv "$tmp/db-next" "$DB_FILE"
-    generate_singbox_config || exit 1
+    _apply_singbox_config active || exit 1
     jq -e '.inbounds[] | select(.type=="anytls" and .listen_port==443) | .users[] | select(.name=="anytls-default" and .password=="keep-password")' "$CFG/singbox.json" >/dev/null
 )
 
@@ -156,8 +155,12 @@ generate_singbox_config() { return 1; }
 svc() { printf '%s\n' restart >> "$tmp/service-calls"; }
 ! _regenerate_proxy_configs
 [[ $(cat "$CFG/singbox.json") == old-config && ! -e "$tmp/service-calls" ]]
-generate_singbox_config() { printf 'new-config' > "$CFG/singbox.json"; }
-svc() { return 1; }
+generate_singbox_config() {
+    printf 'new-config' > "$1/singbox.json"
+    printf '{}' > "$1/singbox-managed-rules.json"
+}
+_singbox_service_ready() { return 1; }
+svc() { [[ "$1" == status ]]; }
 ! _regenerate_proxy_configs
 [[ $(cat "$CFG/singbox.json") == old-config ]]
 echo 'Sing-box route tests passed'

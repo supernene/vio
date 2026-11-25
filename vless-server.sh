@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.5 [服务端]
+#  多协议代理一键部署脚本 v3.5.6 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.5"
+readonly VERSION="3.5.6"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/supernene/vio"
 readonly SCRIPT_REPO="supernene/vio"
@@ -1544,27 +1544,9 @@ rebuild_and_reload_xray() {
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_singbox() {
     local silent="${1:-}"
-    
-    # 重新生成 Sing-box 配置
-    if generate_singbox_config; then
-        # 检查 Sing-box 服务是否在运行
-        if svc status vless-singbox 2>/dev/null; then
-            # 重载服务
-            if svc restart vless-singbox 2>/dev/null; then
-                [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并重载"
-                return 0
-            else
-                [[ -z "$silent" ]] && _warn "配置已更新，服务重载失败"
-                return 1
-            fi
-        else
-            [[ -z "$silent" ]] && _ok "Sing-box 配置已更新"
-            return 0
-        fi
-    else
-        [[ -z "$silent" ]] && _err "Sing-box 配置重建失败"
-        return 1
-    fi
+    _apply_singbox_config active || return 1
+    [[ -n "$silent" ]] || _ok "Sing-box 配置已更新"
+    return 0
 }
 
 
@@ -2901,7 +2883,11 @@ register_protocol() {
     # 确定核心类型
     local core="xray"
     if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-        core="singbox"
+        local mode="${INSTALL_MODE:-add}" old_port="${REPLACE_PORT:-}"
+        unset INSTALL_MODE REPLACE_PORT
+        [[ "$mode" == replace ]] || mode=add
+        _change_singbox_nodes "$mode" "$protocol" "$old_port" "$config_json"
+        return $?
     fi
     
     # 获取端口
@@ -5846,7 +5832,10 @@ gen_anytls_link() {
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}AnyTLS${ip_suffix:+-${ip_suffix}}"
     local insecure=1
-    _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni" && insecure=0
+    if _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni" ||
+       _existing_acme_variant "$sni" >/dev/null; then
+        insecure=0
+    fi
     printf '%s\n' "anytls://${password}@${ip}:${port}?sni=${sni}&allowInsecure=${insecure}#${name}"
 }
 
@@ -9321,10 +9310,107 @@ _merge_singbox_manual_routes() {
 }
 
 # 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
+_singbox_db_nodes() {
+    jq -ce '
+        def port_number:
+            if type == "string" and test("^[0-9]+$") then tonumber else . end |
+            if type == "number" and . == floor and . >= 1 and . <= 65535 then .
+            else error("invalid node port") end;
+        (if has("singbox") then .singbox else {} end) |
+        if type != "object" then error("invalid singbox database") else . end |
+        [to_entries[] | .key as $proto | .value |
+            (if type == "object" then [.] elif type == "array" then .
+             else error("invalid node list: " + $proto) end)[] |
+            if type != "object" then error("invalid node: " + $proto) else . end |
+            .port |= port_number |
+            if .listen_port != null then .listen_port |= port_number else . end |
+            {protocol: $proto, tag: ($proto + "-in-" + (.port | tostring)), config: .}] |
+        if length == (map(.tag) | unique | length) then . else error("duplicate singbox node ID") end
+    ' "${1:-$DB_FILE}"
+}
+
+# The optional public endpoint belongs to clients; it is never a listen address.
+_singbox_advertised_host() {
+    local protocol="$1" cfg="$2" addr
+    case "$protocol" in hy2|tuic|anytls) ;; *) return 0 ;; esac
+    addr=$(jq -r '.server // .address // empty' <<< "$cfg") || return 1
+    if [[ "$addr" == *:* && "$addr" != \[*\] ]]; then addr="[$addr]"; fi
+    printf '%s' "$addr"
+}
+
+_build_singbox_inbound() {
+    local proto="$1" tag="$2" cfg="$3" default_listen="$4"
+    local cert="$CFG/certs/server.crt" key="$CFG/certs/server.key" sni domain variant
+    case "$proto" in
+        hy2)
+            sni=$(jq -r '.sni // "www.bing.com"' <<< "$cfg") || return 1
+            domain=""
+            [[ ! -f "$CFG/cert_domain" ]] || domain=$(<"$CFG/cert_domain")
+            if [[ "$sni" != "$domain" || ! -f "$cert" ]]; then
+                cert="$CFG/certs/hy2/server.crt" key="$CFG/certs/hy2/server.key"
+            fi
+            ;;
+        tuic)
+            if [[ -f "$CFG/certs/tuic/server.crt" ]]; then
+                cert="$CFG/certs/tuic/server.crt" key="$CFG/certs/tuic/server.key"
+            fi
+            ;;
+        anytls)
+            sni=$(jq -r '.sni // "www.bing.com"' <<< "$cfg") || return 1
+            # Resolve a matching ACME pair without replacing the shared live certificate.
+            if ! _valid_trusted_cert_pair "$cert" "$key" "$sni"; then
+                if variant=$(_existing_acme_variant "$sni"); then
+                    local acme_dir="$HOME/.acme.sh/$sni"
+                    [[ "$variant" != ecc ]] || acme_dir+="_ecc"
+                    cert="$acme_dir/fullchain.cer" key="$acme_dir/$sni.key"
+                elif ! _valid_self_cert_pair "$cert" "$key"; then
+                    _err "AnyTLS 节点 $tag 缺少匹配的证书或私钥"
+                    return 1
+                fi
+            fi
+            ;;
+        ss2022|ss-legacy) ;;
+        *) _err "未知 Sing-box 协议: $proto"; return 1 ;;
+    esac
+
+    # .port is the public port and node ID; only listen fields control binding.
+    jq -ce --arg proto "$proto" --arg tag "$tag" --arg addr "$default_listen" \
+        --arg cert "$cert" --arg key "$key" '
+        def nonempty: if type == "string" and length > 0 then . else error("missing credential or address") end;
+        def secret: if type == "number" then tostring else . end | nonempty;
+        def user_name: $proto + "-" + (.name | secret);
+        def node_users:
+            (.users // []) | if type == "array" then . else error("invalid user list") end;
+        def password_users:
+            [{name: ($proto + "-default"), password: (.password | secret)}] +
+            [node_users[] | select(.name != "default") | {name: user_name, password: (.uuid | secret)}];
+        def tls: {enabled: true, certificate_path: $cert, key_path: $key};
+        {tag: $tag, listen: ((.listen_addr // .listen // $addr) | nonempty), listen_port: (.listen_port // .port)} +
+        (if $proto == "anytls" then
+            {type: "anytls", users: password_users, tls: tls}
+         elif $proto == "hy2" then
+            {type: "hysteria2", users: password_users, ignore_client_bandwidth: true,
+             tls: (tls + {alpn: ["h3"]}), masquerade: "https://www.bing.com"}
+         elif $proto == "tuic" then
+            (.password | secret) as $password |
+            {type: "tuic", users: ([{name: "tuic-default", uuid: (.uuid | secret), password: $password}] +
+               [node_users[] | select(.name != "default") | {name: user_name, uuid: (.uuid | secret), password: $password}]),
+             congestion_control: "bbr", tls: (tls + {alpn: ["h3"]})}
+         else
+            {type: "shadowsocks", password: (.password | secret),
+             method: (.method // (if $proto == "ss-legacy" then "aes-256-gcm" else "2022-blake3-aes-128-gcm" end))}
+         end)
+    ' <<< "$cfg"
+}
+
+# Write validated candidate files to a staging directory, never to live paths.
 generate_singbox_config() {
-    _ensure_singbox_default_users
-    local singbox_protocols=$(db_list_protocols "singbox")
-    [[ -z "$singbox_protocols" ]] && return 1
+    local stage="$1" nodes
+    nodes=$(_singbox_db_nodes) || return 1
+    if [[ "$nodes" == "[]" ]]; then
+        _err "没有有效的 Sing-box 协议配置"
+        return 1
+    fi
     
     mkdir -p "$CFG"
     
@@ -9698,232 +9784,28 @@ generate_singbox_config() {
         fi
     fi
     
-    local inbounds="[]"
-    local success_count=0
-    
-    for proto in $singbox_protocols; do
-        local cfg=$(db_get "singbox" "$proto")
-        [[ -z "$cfg" ]] && continue
-        
-        local port=$(echo "$cfg" | jq -r '.port // empty')
-        [[ -z "$port" ]] && continue
-        
-        local inbound=""
-        
-        case "$proto" in
-            hy2)
-                local password=$(echo "$cfg" | jq -r '.password // empty')
-                local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
-                
-                # 智能证书选择：优先使用 ACME 证书，否则使用 hy2 独立自签证书
-                local cert_path="$CFG/certs/hy2/server.crt"
-                local key_path="$CFG/certs/hy2/server.key"
-                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
-                    local cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
-                    if [[ "$sni" == "$cert_domain" ]]; then
-                        cert_path="$CFG/certs/server.crt"
-                        key_path="$CFG/certs/server.key"
-                    fi
-                fi
-                
-                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
-                local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
-                
-                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # 有自定义用户，为每个用户生成 {name, password}
-                    # hy2 用户的 uuid 字段存储的是密码；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '{name: $name, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: ("hy2-" + .name), password: .uuid}))) | unique_by(.name)')
-                else
-                    # 没有自定义用户，使用默认密码
-                    users_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '[{name: $name, password: $pw}]')
-                fi
-                
-                inbound=$(jq -n \
-                    --argjson port "$port" \
-                    --argjson users "$users_json" \
-                    --arg cert "$cert_path" \
-                    --arg key "$key_path" \
-                    --arg listen_addr "$listen_addr" \
-                '{
-                    type: "hysteria2",
-                    tag: "hy2-in",
-                    listen: $listen_addr,
-                    listen_port: $port,
-                    users: $users,
-                    ignore_client_bandwidth: true,
-                    tls: {
-                        enabled: true,
-                        certificate_path: $cert,
-                        key_path: $key,
-                        alpn: ["h3"]
-                    },
-                    masquerade: "https://www.bing.com"
-                }')
-                ;;
-            tuic)
-                local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
-                local password=$(echo "$cfg" | jq -r '.password // empty')
-                
-                # TUIC 使用独立证书目录
-                local cert_path="$CFG/certs/tuic/server.crt"
-                local key_path="$CFG/certs/tuic/server.key"
-                [[ ! -f "$cert_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
-                
-                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
-                local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
-                
-                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # TUIC 用户的 uuid 字段存储的是真正用户 UUID；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '{name: $name, uuid: $id, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" --arg pw "$password" '([$chk_def] + ($db_users | map({name: ("tuic-" + .name), uuid: .uuid, password: $pw}))) | unique_by(.name)')
-                else
-                    users_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '[{name: $name, uuid: $id, password: $pw}]')
-                fi
-                
-                inbound=$(jq -n \
-                    --argjson port "$port" \
-                    --argjson users "$users_json" \
-                    --arg cert "$cert_path" \
-                    --arg key "$key_path" \
-                    --arg listen_addr "$listen_addr" \
-                '{
-                    type: "tuic",
-                    tag: "tuic-in",
-                    listen: $listen_addr,
-                    listen_port: $port,
-                    users: $users,
-                    congestion_control: "bbr",
-                    tls: {
-                        enabled: true,
-                        certificate_path: $cert,
-                        key_path: $key,
-                        alpn: ["h3"]
-                    }
-                }')
-                ;;
-            anytls)
-                local password=$(echo "$cfg" | jq -r '.password // empty')
-                local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
-                local cert_path="$CFG/certs/server.crt"
-                local key_path="$CFG/certs/server.key"
-                if ! _valid_trusted_cert_pair "$cert_path" "$key_path" "$sni"; then
-                    local variant
-                    if variant=$(_existing_acme_variant "$sni"); then
-                        _install_acme_cert "$sni" "$HOME/.acme.sh/acme.sh" "$variant" || return 1
-                    elif ! _valid_self_cert_pair "$cert_path" "$key_path"; then
-                        _err "AnyTLS 缺少有效证书/私钥，未重建 singbox.json"
-                        return 1
-                    fi
-                fi
-
-                # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
-                local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
-
-                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # AnyTLS 用户的 uuid 字段存储的是真正用户密码；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '{name: $name, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: ("anytls-" + .name), password: .uuid}))) | unique_by(.name)')
-                else
-                    users_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '[{name: $name, password: $pw}]')
-                fi
-
-                inbound=$(jq -n \
-                    --argjson port "$port" \
-                    --argjson users "$users_json" \
-                    --arg cert "$cert_path" \
-                    --arg key "$key_path" \
-                    --arg listen_addr "$listen_addr" \
-                '{
-                    type: "anytls",
-                    tag: "anytls-in",
-                    listen: $listen_addr,
-                    listen_port: $port,
-                    users: $users,
-                    tls: {
-                        enabled: true,
-                        certificate_path: $cert,
-                        key_path: $key
-                    }
-                }')
-                ;;
-            ss2022|ss-legacy)
-                local password=$(echo "$cfg" | jq -r '.password // empty')
-                local default_method="2022-blake3-aes-128-gcm"
-                [[ "$p" == "ss-legacy" ]] && default_method="aes-256-gcm"
-                local method=$(echo "$cfg" | jq -r '.method // empty')
-                [[ -z "$method" ]] && method="$default_method"
-                
-                inbound=$(jq -n \
-                    --argjson port "$port" \
-                    --arg method "$method" \
-                    --arg password "$password" \
-                    --arg tag "${p}-in" \
-                    --arg listen_addr "$listen_addr" \
-                '{
-                    type: "shadowsocks",
-                    tag: $tag,
-                    listen: $listen_addr,
-                    listen_port: $port,
-                    method: $method,
-                    password: $password
-                }')
-                ;;
-        esac
-        
-        if [[ -n "$inbound" ]]; then
-            inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
-            ((success_count++))
-        fi
-    done
-    
-    if [[ $success_count -eq 0 ]]; then
-        _err "没有有效的 Sing-box 协议配置"
-        return 1
-    fi
-    
+    local inbounds="[]" proto tag cfg inbound node node_lines
+    node_lines=$(jq -c '.[]' <<< "$nodes") || return 1
+    while IFS= read -r node; do
+        proto=$(jq -r '.protocol' <<< "$node") || return 1
+        tag=$(jq -r '.tag' <<< "$node") || return 1
+        cfg=$(jq -c '.config' <<< "$node") || return 1
+        inbound=$(_build_singbox_inbound "$proto" "$tag" "$cfg" "$listen_addr") || {
+            _err "Sing-box 节点 $tag 配置生成失败"
+            return 1
+        }
+        inbounds=$(jq -c --argjson ib "$inbound" '. + [$ib]' <<< "$inbounds") || return 1
+    done <<< "$node_lines"
     # 生成用户级路由规则 (auth_user) 和所需的 outbounds
     local user_routing_rules="[]"
     local user_outbounds="[]"
     local chain_outbounds_added=""  # 跟踪已添加的链式代理 outbound
     
-    for proto in $singbox_protocols; do
-        local db_users=$(jq -r --arg p "$proto" '
-            .singbox[$p] as $cfg |
-            if $cfg == null then empty
-            elif ($cfg | type) == "array" then
-                [$cfg[].users // [] | .[]] | unique_by(.name) | .[]
-            else
-                $cfg.users // [] | .[]
-            end | @json
-        ' "$DB_FILE" 2>/dev/null)
+    while IFS= read -r node; do
+        proto=$(jq -r '.protocol' <<< "$node") || return 1
+        tag=$(jq -r '.tag' <<< "$node") || return 1
+        local db_users
+        db_users=$(jq -c '.config.users // [] | .[]' <<< "$node") || return 1
         
         while IFS= read -r user_json; do
             [[ -z "$user_json" ]] && continue
@@ -9969,10 +9851,11 @@ generate_singbox_config() {
             local stat_user=$(_singbox_stat_key_for_user "$proto" "$uname")
             user_routing_rules=$(echo "$user_routing_rules" | jq \
                 --arg user "$stat_user" \
+                --arg tag "$tag" \
                 --arg outbound "$outbound_name" \
-                '. + [{auth_user: [$user], outbound: $outbound}]')
+                '. + [{inbound: [$tag], auth_user: [$user], outbound: $outbound}]') || return 1
         done <<< "$db_users"
-    done
+    done <<< "$node_lines"
     
     # 将用户路由所需的 outbounds 添加到 base_config
     if [[ "$user_outbounds" != "[]" ]]; then
@@ -10030,25 +9913,162 @@ generate_singbox_config() {
     local managed_rules managed_sets managed_config tmp_config tmp_managed
     managed_rules=$(echo "$base_config" | jq -c '.route.rules // []') || return 1
     managed_sets=$(echo "$base_config" | jq -c '.route.rule_set // []') || return 1
-    managed_config=$(jq -n --argjson rules "$managed_rules" --argjson sets "$managed_sets" '{rules:$rules,rule_set:$sets}')
+    managed_config=$(jq -n --argjson rules "$managed_rules" --argjson sets "$managed_sets" '{rules:$rules,rule_set:$sets}') || return 1
     base_config=$(_merge_singbox_manual_routes "$base_config") || return 1
-    tmp_config=$(mktemp "$CFG/.singbox.XXXXXXXX.json") || return 1
-    tmp_managed=$(mktemp "$CFG/.singbox-managed.XXXXXXXX.json") || { rm -f "$tmp_config"; return 1; }
+    tmp_config="$stage/singbox.json"
+    tmp_managed="$stage/singbox-managed-rules.json"
     if ! printf '%s\n' "$base_config" | jq . > "$tmp_config" ||
        ! printf '%s\n' "$managed_config" | jq . > "$tmp_managed"; then
         rm -f "$tmp_config" "$tmp_managed"
         _err "Sing-box 配置 JSON 格式错误"
         return 1
     fi
-    if command -v sing-box >/dev/null 2>&1 && ! sing-box check -c "$tmp_config"; then
+    if ! sing-box check -c "$tmp_config"; then
         rm -f "$tmp_config" "$tmp_managed"
         _err "Sing-box 配置校验失败，原运行配置保持不变"
         return 1
     fi
-    mv -f "$tmp_config" "$CFG/singbox.json" &&
-        mv -f "$tmp_managed" "$CFG/singbox-managed-rules.json" || return 1
-    
-    _ok "Sing-box 配置生成成功 ($success_count 个协议)"
+    return 0
+}
+
+_singbox_service_ready() {
+    # A systemd Type=simple service can exit after start/restart already returned.
+    sleep 1
+    if [[ "${DISTRO:-}" == alpine ]]; then
+        svc status vless-singbox >/dev/null 2>&1
+    else
+        [[ $(systemctl is-active vless-singbox 2>/dev/null) == active ]]
+    fi
+}
+
+_apply_singbox_config() {
+    local mode="${1:-active}" db_backup="${2:-}" stage name action="" was_running=false failed=false restored=true
+    local files=(singbox-managed-rules.json singbox.json)
+    mkdir -p "$CFG" || return 1
+    stage=$(mktemp -d "$CFG/.singbox.XXXXXXXX") || return 1
+    if [[ "$mode" != remove ]] && ! generate_singbox_config "$stage"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    for name in "${files[@]}"; do
+        if [[ -e "$CFG/$name" ]] && ! cp -p "$CFG/$name" "$stage/$name.old"; then
+            rm -rf -- "$stage"
+            return 1
+        fi
+    done
+    if svc status vless-singbox >/dev/null 2>&1; then
+        was_running=true
+        action=restart
+    elif [[ "$mode" == start ]]; then
+        action=start
+    fi
+
+    if [[ "$mode" == remove ]]; then
+        if $was_running && ! svc stop vless-singbox; then
+            [[ -z "$db_backup" ]] || mv -f -- "$db_backup" "$DB_FILE"
+            svc status vless-singbox >/dev/null 2>&1 || svc start vless-singbox || true
+            rm -rf -- "$stage"
+            return 1
+        fi
+        action=stop
+        rm -f -- "$CFG/singbox.json" "$CFG/singbox-managed-rules.json" || failed=true
+    else
+        # Keep an existing running unit. Publish the main config file last.
+        if [[ "$mode" == start && "$was_running" == false ]]; then
+            if ! create_server_scripts || ! create_singbox_service; then
+                rm -rf -- "$stage"
+                return 1
+            fi
+        fi
+        for name in "${files[@]}"; do
+            if ! mv -f -- "$stage/$name" "$CFG/$name"; then
+                failed=true
+                action=""
+                break
+            fi
+        done
+        if ! $failed && [[ -n "$action" ]]; then
+            if ! svc "$action" vless-singbox || ! _singbox_service_ready; then
+                failed=true
+            fi
+        fi
+    fi
+    if $failed; then
+        if [[ -n "$db_backup" ]]; then
+            mv -f -- "$db_backup" "$DB_FILE" || restored=false
+        fi
+        for name in "${files[@]}"; do
+            if [[ -e "$stage/$name.old" ]]; then
+                mv -f -- "$stage/$name.old" "$CFG/$name" || restored=false
+            else
+                rm -f -- "$CFG/$name" || restored=false
+            fi
+        done
+        if [[ -n "$action" ]]; then
+            if $was_running; then
+                svc restart vless-singbox && _singbox_service_ready || restored=false
+            elif svc status vless-singbox >/dev/null 2>&1; then
+                svc stop vless-singbox || restored=false
+            fi
+        fi
+        if $restored; then
+            _err "Sing-box 应用失败，已恢复原配置和服务状态"
+            rm -rf -- "$stage"
+        else
+            _err "Sing-box 应用失败，未能完整恢复；请检查配置和服务（暂存目录: $stage）"
+        fi
+        return 1
+    fi
+    case "$mode" in
+        remove) svc disable vless-singbox >/dev/null 2>&1 || true ;;
+        start) svc enable vless-singbox >/dev/null 2>&1 || true ;;
+    esac
+    rm -rf -- "$stage"
+    return 0
+}
+
+# A node is identified by its protocol and public port, even behind a proxy.
+_change_singbox_nodes() {
+    local operation="$1" proto="$2" port="$3" config="${4:-null}" txn nodes mode=start
+    init_db && _singbox_db_nodes >/dev/null || return 1
+    txn=$(mktemp -d "$CFG/.singbox-db.XXXXXXXX") || return 1
+    if ! cp -p "$DB_FILE" "$txn/db.old" ||
+       ! jq -e --arg op "$operation" --arg proto "$proto" --arg port "$port" --argjson cfg "$config" '
+        def node_port: .port | tonumber;
+        .singbox[$proto] as $field |
+        ($field | if type == "array" then . elif . == null then [] else [.] end) as $nodes |
+        (if $op == "add" then
+            if any($nodes[]; node_port == ($cfg | node_port)) then error("node already exists")
+            elif $nodes == [] then $cfg else $nodes + [$cfg] end
+         elif $op == "delete" and $port == "all" then
+            if $nodes == [] then error("node not found") else [] end
+         elif ([$nodes[] | select(node_port == ($port | tonumber))] | length) != 1 then error("node not found")
+         elif $op == "delete" then [$nodes[] | select(node_port != ($port | tonumber))]
+         elif $op == "replace" then
+            ($nodes | map(if node_port == ($port | tonumber) then . + $cfg else . end)) |
+            if ($field | type) == "array" then . else .[0] end
+         else error("invalid node operation") end) as $next |
+        if $next == [] then del(.singbox[$proto]) else .singbox[$proto] = $next end
+       ' "$DB_FILE" > "$txn/db.next" ||
+       ! nodes=$(_singbox_db_nodes "$txn/db.next") ||
+       ! mv -f -- "$txn/db.next" "$DB_FILE"; then
+        rm -rf -- "$txn"
+        return 1
+    fi
+    if [[ "$operation" == delete ]]; then
+        mode=active
+        # Only a successful explicit deletion may transition to zero nodes.
+        [[ "$nodes" != "[]" ]] || mode=remove
+    fi
+    if ! _apply_singbox_config "$mode" "$txn/db.old"; then
+        if [[ -f "$txn/db.old" ]] && ! mv -f -- "$txn/db.old" "$DB_FILE"; then
+            _err "Sing-box 节点数据库回滚失败，备份: $txn/db.old"
+            return 1
+        fi
+        rm -rf -- "$txn"
+        return 1
+    fi
+    rm -rf -- "$txn"
     return 0
 }
 
@@ -10484,7 +10504,7 @@ gen_hy2_server_config() {
     # 写入数据库（Sing-box 从数据库读取配置生成 singbox.json）
     register_protocol "hy2" "$(build_config \
         password "$password" port "$port" sni "$sni" \
-        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")"
+        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")" || return 1
     
     # 保存 join 信息
     local extra_lines=()
@@ -10686,7 +10706,7 @@ gen_tuic_server_config() {
     # 写入数据库（Sing-box 从数据库读取配置生成 singbox.json）
     register_protocol "tuic" "$(build_config \
         uuid "$uuid" password "$password" port "$port" sni "$sni" \
-        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")"
+        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")" || return 1
     
     # 保存 join 信息
     local extra_lines=()
@@ -10702,24 +10722,10 @@ gen_tuic_server_config() {
 gen_anytls_server_config() {
     local password="$1" port="$2" sni="${3:-bing.com}"
     mkdir -p "$CFG"
-
-    # 安装入口已明确选定正式证书或自签名模式；配置重建不得覆盖证书。
-    if ! _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key" "$sni"; then
-        local variant
-        if variant=$(_existing_acme_variant "$sni"); then
-            _install_acme_cert "$sni" "$HOME/.acme.sh/acme.sh" "$variant" || return 1
-        elif _valid_trusted_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key"; then
-            _err "现有正式证书与 AnyTLS SNI 不匹配"
-            return 1
-        elif _valid_self_cert_pair "$CFG/certs/server.crt" "$CFG/certs/server.key"; then
-            _warn "保留自签名证书模式"
-        else
-            _err "AnyTLS 证书缺失或无效；请重新选择证书模式"
-            return 1
-        fi
-    fi
-
-    register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")"
+    local config
+    config=$(jq -cn --arg password "$password" --arg port "$port" --arg sni "$sni" \
+        '{password: $password, port: ($port | tonumber), sni: $sni}') || return 1
+    register_protocol anytls "$config" || return 1
     _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni" \
         "gen_anytls_link %s $port $password $sni"
     cp "$CFG/anytls.join" "$CFG/join.txt" 2>/dev/null
@@ -11429,9 +11435,7 @@ start_services() {
         fi
         
         if check_cmd sing-box; then
-            create_singbox_service
-            _start_core_service "vless-singbox" "sing-box" "$singbox_protocols" "generate_singbox_config" || \
-                failed_services+=("vless-singbox")
+            _apply_singbox_config start || failed_services+=("vless-singbox")
         fi
     fi
     
@@ -11495,24 +11499,25 @@ start_services() {
 }
 
 ensure_singbox_runtime_consistency() {
-    local singbox_protocols=$(get_singbox_protocols)
-    [[ -z "$singbox_protocols" ]] && return 0
+    local nodes
+    [[ -f "$DB_FILE" ]] || return 0
     check_cmd sing-box || return 0
+    nodes=$(_singbox_db_nodes) || return 1
+    [[ "$nodes" != '[]' ]] || return 0
 
-    local need_rebuild=false
-    [[ ! -f "$CFG/singbox.json" ]] && need_rebuild=true
-
-    if [[ "$need_rebuild" == "false" ]] && ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
-        need_rebuild=true
-    fi
-
-    if [[ "$need_rebuild" == "true" ]]; then
-        _info "检测到 Sing-box 配置缺失或无效，正在自动重建..."
-        generate_singbox_config || return 1
-        create_server_scripts
-        create_singbox_service
-        svc enable vless-singbox >/dev/null 2>&1 || true
-        svc restart vless-singbox || svc start vless-singbox || return 1
+    # An old file can pass check while one protocol's array was skipped entirely.
+    # Accept legacy single-node tags when the listener already matches.
+    if ! jq -e --argjson nodes "$nodes" '
+        .inbounds as $inbounds |
+        all($nodes[]; . as $node | any($inbounds[];
+            (.tag == $node.tag or .tag == ($node.protocol + "-in")) and
+            .listen_port == ($node.config.listen_port // $node.config.port) and
+            (($node.config.listen_addr // $node.config.listen) as $listen |
+             $listen == null or .listen == $listen)))
+    ' "$CFG/singbox.json" >/dev/null 2>&1 ||
+       ! sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+        _info "检测到 Sing-box 配置缺失、无效或遗漏节点，正在自动重建..."
+        _apply_singbox_config start || return 1
         _ok "Sing-box 配置已自动修复"
     fi
 }
@@ -14340,28 +14345,7 @@ _regenerate_proxy_configs() {
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        local config_backup="" managed_backup=""
-        if [[ -f "$CFG/singbox.json" ]]; then
-            config_backup=$(mktemp) || return 1
-            cp "$CFG/singbox.json" "$config_backup" || return 1
-        fi
-        if [[ -f "$CFG/singbox-managed-rules.json" ]]; then
-            managed_backup=$(mktemp) || return 1
-            cp "$CFG/singbox-managed-rules.json" "$managed_backup" || return 1
-        fi
-        if ! generate_singbox_config; then
-            rm -f "$config_backup" "$managed_backup"
-            return 1
-        fi
-        if ! svc restart vless-singbox; then
-            [[ -n "$config_backup" ]] && cp "$config_backup" "$CFG/singbox.json"
-            [[ -n "$managed_backup" ]] && cp "$managed_backup" "$CFG/singbox-managed-rules.json"
-            svc restart vless-singbox || true
-            rm -f "$config_backup" "$managed_backup"
-            _err "Sing-box 重启失败，运行配置已恢复"
-            return 1
-        fi
-        rm -f "$config_backup" "$managed_backup"
+        _apply_singbox_config active || return 1
     fi
 }
 
@@ -14570,8 +14554,7 @@ configure_direct_outbound() {
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
         _info "重新生成 Sing-box 配置..."
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
+        _apply_singbox_config active || return 1
     fi
 }
 
@@ -14820,9 +14803,7 @@ setup_warp_ipv6_chain() {
     # 重新生成 Sing-box 配置
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
-        svc start vless-singbox 2>/dev/null
+        _apply_singbox_config active || return 1
         _ok "Sing-box 配置已更新"
     fi
     
@@ -17591,6 +17572,19 @@ show_all_share_links() {
             if [[ -n "$master_port" && ("$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws") ]]; then
                 display_port="$master_port"
             fi
+
+            local advertised_host
+            advertised_host=$(_singbox_advertised_host "$protocol" "$cfg")
+            if [[ -n "$advertised_host" ]]; then
+                local link=""
+                case "$protocol" in
+                    hy2) link=$(gen_hy2_link "$advertised_host" "$display_port" "$password" "$sni" "$country_code") ;;
+                    tuic) link=$(gen_tuic_link "$advertised_host" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
+                    anytls) link=$(gen_anytls_link "$advertised_host" "$display_port" "$password" "$sni" "$country_code") ;;
+                esac
+                [[ -z "$link" ]] || { echo -e "  ${G}$link${NC}"; has_links=true; }
+                continue
+            fi
             
             # 生成 IPv4 链接
             if [[ -n "$ipv4" ]]; then
@@ -17827,8 +17821,14 @@ show_single_protocol_info() {
     echo -e "  ${W}$(get_protocol_name $protocol) 配置详情${NC}"
     _line
     
-    [[ -n "$ipv4" ]] && echo -e "  IPv4: ${G}$ipv4${NC}"
-    [[ -n "$ipv6" ]] && echo -e "  IPv6: ${G}$ipv6${NC}"
+    local advertised_host
+    advertised_host=$(_singbox_advertised_host "$protocol" "$cfg")
+    if [[ -n "$advertised_host" ]]; then
+        echo -e "  对外地址: ${G}$advertised_host${NC}"
+    else
+        [[ -n "$ipv4" ]] && echo -e "  IPv4: ${G}$ipv4${NC}"
+        [[ -n "$ipv6" ]] && echo -e "  IPv6: ${G}$ipv6${NC}"
+    fi
     echo -e "  端口: ${G}$display_port${NC}"
     [[ "$is_fallback_protocol" == "true" ]] && echo -e "  ${D}(通过 $master_name 主协议回落，内部端口: $port)${NC}"
     
@@ -17839,6 +17839,7 @@ show_single_protocol_info() {
     # 确定用于配置显示的 IP 地址：优先 IPv4，纯 IPv6 环境使用 IPv6（带方括号）
     local config_ip="$ipv4"
     [[ -z "$config_ip" ]] && config_ip="[$ipv6]"
+    [[ -z "$advertised_host" ]] || config_ip="$advertised_host"
     
     case "$protocol" in
         vless)
@@ -18125,7 +18126,9 @@ show_single_protocol_info() {
     
     # 确定使用的 IP 地址：优先 IPv4，纯 IPv6 环境使用 IPv6
     local ip_addr=""
-    if [[ -n "$ipv4" ]]; then
+    if [[ -n "$advertised_host" ]]; then
+        ip_addr="$advertised_host"
+    elif [[ -n "$ipv4" ]]; then
         ip_addr="$ipv4"
     elif [[ -n "$ipv6" ]]; then
         ip_addr="[$ipv6]"  # IPv6 需要用方括号包裹
@@ -18711,77 +18714,19 @@ uninstall_specific_protocol() {
             _ok "Xray 服务已停止"
         fi
     elif [[ " $SINGBOX_PROTOCOLS " == *" $selected_protocol "* ]]; then
-        # Sing-box 协议 (hy2/tuic)：需要重新生成配置
-        
-        # Hysteria2: 先清理 iptables 端口跳跃规则
-        if [[ "$selected_protocol" == "hy2" ]]; then
-            cleanup_hy2_nat_rules
-            rm -rf "$CFG/certs/hy2"
-        fi
-        
-        # TUIC: 先清理 iptables 端口跳跃规则，删除证书目录
-        if [[ "$selected_protocol" == "tuic" ]]; then
-            cleanup_hy2_nat_rules
-            rm -rf "$CFG/certs/tuic"
-        fi
-        
-        # 根据选择的端口进行卸载
-        if [[ "$SELECTED_PORT" == "all" ]]; then
-            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
+        _change_singbox_nodes delete "$selected_protocol" "$SELECTED_PORT" || {
+            _err "删除 Sing-box 节点失败"
+            _pause
+            return 1
+        }
+        if ! db_exists singbox "$selected_protocol"; then
             rm -f "$CFG/${selected_protocol}.join"
-        else
-            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
-            
-            # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
-                
-                # 检查是否还有其他端口实例
-                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
-                if [[ -z "$remaining_ports" ]]; then
-                    # 没有剩余端口，完全卸载
-                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
-                    rm -f "$CFG/${selected_protocol}.join"
-                else
-                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
-                fi
-            else
-                # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join"
-            fi
         fi
-        
-        # 检查是否还有其他 Sing-box 协议
-        local remaining_singbox=$(get_singbox_protocols)
-        if [[ -n "$remaining_singbox" ]]; then
-            _info "重新生成 Sing-box 配置..."
-            svc stop vless-singbox 2>/dev/null
-            rm -f "$CFG/singbox.json"
-            
-            if generate_singbox_config; then
-                _ok "Sing-box 配置已更新"
-                svc start vless-singbox
-            else
-                _err "Sing-box 配置生成失败"
-            fi
-        else
-            _info "没有其他 Sing-box 协议，停止 Sing-box 服务..."
-            svc stop vless-singbox 2>/dev/null
-            svc disable vless-singbox 2>/dev/null
-            rm -f "$CFG/singbox.json"
-            # 删除 Sing-box 服务文件
-            if [[ "$DISTRO" == "alpine" ]]; then
-                rc-update del vless-singbox default 2>/dev/null
-                rm -f "/etc/init.d/vless-singbox"
-            else
-                rm -f "/etc/systemd/system/vless-singbox.service"
-                systemctl daemon-reload
-            fi
-            _ok "Sing-box 服务已停止"
-        fi
+        # Subscription and other cores are independent of this node change.
+        [[ ! -f "$CFG/sub.info" ]] || generate_sub_files
+        _ok "Sing-box 节点已卸载"
+        _pause
+        return 0
     else
         # 独立协议 (Snell/AnyTLS/ShadowTLS)：停止服务，删除配置和服务文件
         local service_name="vless-${selected_protocol}"
@@ -20170,7 +20115,7 @@ do_install_server() {
 
             _info "生成配置..."
             # ★改：把 hop 参数传进去
-            gen_hy2_server_config "$password" "$port" "$final_sni" "$hop_enable" "$hop_start" "$hop_end"
+            gen_hy2_server_config "$password" "$port" "$final_sni" "$hop_enable" "$hop_start" "$hop_end" || return 1
             ;;
         trojan)
             local password=$(ask_password 16 "Trojan密码")
@@ -20372,13 +20317,19 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_tuic_server_config "$uuid" "$password" "$port" "$final_sni" "$hop_enable" "$hop_start" "$hop_end"
+            gen_tuic_server_config "$uuid" "$password" "$port" "$final_sni" "$hop_enable" "$hop_start" "$hop_end" || return 1
             ;;
         anytls)
             local password=$(ask_password 16 "AnyTLS密码")
             local default_sni=$(gen_sni)
             local cert_domain
-            cert_domain=$(ask_cert_config "$default_sni" "anytls") || return 1
+            # A second node must not replace the certificate of an existing node.
+            if db_exists singbox anytls; then
+                cert_domain=$(db_get singbox anytls | jq -r '(if type == "array" then .[0] else . end).sni // "www.bing.com"') || return 1
+                _info "复用现有 AnyTLS 证书配置"
+            else
+                cert_domain=$(ask_cert_config "$default_sni" "anytls") || return 1
+            fi
             local final_sni="${cert_domain:-$default_sni}"
             
             echo ""
@@ -20467,30 +20418,23 @@ do_install_server() {
             ;;
     esac
     
-    _info "创建服务..."
-    create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
-    create_service "$protocol"
-    _info "启动服务..."
-    
     # 保存当前安装的协议名（防止被后续函数中的循环变量覆盖）
     local current_protocol="$protocol"
+    local install_ok=false
+    if [[ "$core" == singbox ]]; then
+        # register_protocol already validated and applied the Sing-box change.
+        rm -f "$CFG/paused"
+        install_ok=true
+    else
+        _info "创建服务..."
+        create_server_scripts
+        create_service "$protocol"
+        _info "启动服务..."
+        if start_services; then install_ok=true; fi
+    fi
     
-    if start_services; then
+    if $install_ok; then
         create_shortcut   # 安装成功才创建快捷命令
-
-        # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
-        if [[ "${PROTO_KIND[$current_protocol]}" == "singbox" ]]; then
-            generate_singbox_config || { _err "Sing-box 配置重建失败"; _pause; return 1; }
-            create_server_scripts
-            create_singbox_service
-            svc enable vless-singbox >/dev/null 2>&1 || true
-            svc restart vless-singbox || svc start vless-singbox || { _err "Sing-box 服务重启失败"; _pause; return 1; }
-            if [[ ! -f "$CFG/singbox.json" ]] || ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
-                _err "Sing-box 配置文件未正确生成或校验失败"
-                _pause
-                return 1
-            fi
-        fi
 
         # 已启用 TG 通知且当前安装的是 Xray 协议时，自动补齐流量统计定时任务
         if [[ "${PROTO_KIND[$current_protocol]}" == "xray" ]]; then
@@ -20564,8 +20508,7 @@ do_install_server() {
                     installed_port=$(echo "$cfg" | jq -r '.port')
                 fi
             elif db_exists "singbox" "$current_protocol"; then
-                local cfg=$(db_get "singbox" "$current_protocol")
-                installed_port=$(echo "$cfg" | jq -r '.port')
+                installed_port="$port"
             fi
         fi
 
