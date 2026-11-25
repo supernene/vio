@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.6 [服务端]
+#  多协议代理一键部署脚本 v3.5.7 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.6"
+readonly VERSION="3.5.7"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/supernene/vio"
 readonly SCRIPT_REPO="supernene/vio"
@@ -1516,27 +1516,9 @@ db_migrate_to_multiuser() {
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_xray() {
     local silent="${1:-}"
-    
-    # 重新生成 Xray 配置
-    if generate_xray_config 2>/dev/null; then
-        # 检查 Xray 服务是否在运行
-        if svc status vless-reality 2>/dev/null; then
-            # 重启服务确保配置生效 (reload 可能不可靠)
-            if svc restart vless-reality 2>/dev/null; then
-                [[ -z "$silent" ]] && _ok "配置已更新并重载"
-                return 0
-            else
-                [[ -z "$silent" ]] && _err "配置已更新，但服务重启失败"
-                return 1
-            fi
-        else
-            [[ -z "$silent" ]] && _ok "配置已更新"
-            return 0
-        fi
-    else
-        [[ -z "$silent" ]] && _err "配置重建失败"
-        return 1
-    fi
+    _apply_xray_config active || return 1
+    [[ -n "$silent" ]] || _ok "Xray 配置已更新"
+    return 0
 }
 
 # 用户变更后重建 Sing-box 配置并重载服务
@@ -2133,8 +2115,7 @@ sync_all_user_traffic() {
     
     # 批量处理完成后统一重载配置（避免循环内多次重启）
     if [[ "$need_reload" == "true" ]]; then
-        generate_xray_config 2>/dev/null
-        svc restart vless-reality 2>/dev/null
+        _apply_xray_config active || return 1
     fi
     
     return 0
@@ -2439,17 +2420,8 @@ _save_join_info() {
 # 用法: outer_port=$(_get_master_port "$default_port")
 _get_master_port() {
     local default_port="$1"
-    local master_port=""
-    
-    if db_exists "xray" "vless-vision"; then
-        master_port=$(db_get_field "xray" "vless-vision" "port")
-    elif db_exists "xray" "trojan"; then
-        master_port=$(db_get_field "xray" "trojan" "port")
-    fi
-    
-    # 仅当主协议端口为 8443 时才返回主端口（触发回落）
-    if [[ "$master_port" == "8443" ]]; then
-        echo "$master_port"
+    if _has_master_protocol; then
+        echo 8443
     else
         echo "$default_port"
     fi
@@ -2458,16 +2430,14 @@ _get_master_port() {
 # 检测是否有 TLS 主协议且端口为 8443 (支持 WS 回落的协议)
 # 注意：Reality 使用 uTLS，不支持 WS 类型的回落
 _has_master_protocol() {
-    local master_port=""
-    
-    if db_exists "xray" "vless-vision"; then
-        master_port=$(db_get_field "xray" "vless-vision" "port")
-    elif db_exists "xray" "trojan"; then
-        master_port=$(db_get_field "xray" "trojan" "port")
-    fi
-    
-    # 仅当主协议存在且端口为 8443 时返回成功
-    [[ "$master_port" == "8443" ]]
+    _xray_master_node >/dev/null
+}
+
+_xray_master_node() {
+    local nodes
+    [[ -f "$DB_FILE" ]] || return 1
+    nodes=$(_xray_db_nodes) || return 1
+    jq -ce 'first(.[] | select((.protocol == "vless-vision" or .protocol == "trojan") and .config.port == 8443))' <<< "$nodes"
 }
 
 # 检查证书是否为 CA 签发的真实证书
@@ -2651,7 +2621,7 @@ gen_vless_xhttp_tls_cdn_config() {
         '.users = [{"name": $name, "uuid": $uuid, "quota": 0, "used": 0, "enabled": true, "created": (now | strftime("%Y-%m-%d"))}]')
     
     # 使用 register_protocol 支持多端口和覆盖模式
-    register_protocol "$protocol" "$config_json"
+    register_protocol "$protocol" "$config_json" || return 1
     
     # 生成分享链接 (URL 编码 path)
     local encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
@@ -2889,6 +2859,13 @@ register_protocol() {
         _change_singbox_nodes "$mode" "$protocol" "$old_port" "$config_json"
         return $?
     fi
+    if [[ " $XRAY_PROTOCOLS " == *" $protocol "* ]]; then
+        local mode="${INSTALL_MODE:-add}" old_port="${REPLACE_PORT:-}"
+        unset INSTALL_MODE REPLACE_PORT
+        [[ "$mode" == replace ]] || mode=add
+        _change_xray_nodes "$mode" "$protocol" "$old_port" "$config_json" "${replace_xray_master:-}"
+        return $?
+    fi
     
     # 获取端口
     local port
@@ -3048,15 +3025,50 @@ gen_xray_user_routing_outbounds() {
     done | sort -u
 }
 
-# 生成 Xray 多 inbounds 配置
+_xray_db_nodes() {
+    jq -ce --arg protocols "$XRAY_PROTOCOLS" '
+        def port_number:
+            if type == "string" and test("^[0-9]+$") then tonumber else . end |
+            if type == "number" and . == floor and . >= 1 and . <= 65535 then . else error("invalid Xray port") end;
+        (.xray // {}) as $db |
+        [($protocols | split(" ")[]) as $p | $db[$p] |
+            if . == null then empty elif type == "object" then . elif type == "array" then .[]
+            else error("invalid Xray node list") end |
+            if type == "object" then . else error("invalid Xray node") end |
+            .port |= port_number |
+            if .listen_port != null then .listen_port |= port_number else . end |
+            if .internal_port != null then .internal_port |= port_number else . end |
+            {protocol:$p, tag:($p + "-" + (.port|tostring)), config:.}] |
+        if length == (map(.tag) | unique | length) then . else error("duplicate Xray node ID") end
+    ' "${1:-$DB_FILE}"
+}
+
+_xray_node_accounts() {
+    local proto="$1" cfg="$2" flow="${3:-}"
+    jq -ce --arg proto "$proto" --arg flow "$flow" '
+        def secret: if type == "number" then tostring else . end |
+                    if type == "string" and length > 0 then . else error("invalid Xray credential") end;
+        if .users != null and (.users | type) != "array" then error("invalid Xray users") else . end |
+        if $proto == "socks" and .auth_mode == "noauth" then []
+        else
+            (if (.users | length) > 0 then .users
+             else [{name:"default", uuid:(if $proto == "socks" or ($proto | startswith("trojan")) then .password else .uuid end)}] end) as $users |
+            [. as $node | $users[] | select(.enabled != false and .enabled != "false") |
+                (.name | secret) as $name | (.uuid | secret) as $secret |
+                ($name + "@" + $proto) as $email |
+                if $proto == "socks" then {user:(if $name == "default" then ($node.username | secret) else $name end),pass:$secret}
+                elif $proto | startswith("trojan") then {password:$secret,email:$email}
+                elif $proto == "vmess-ws" then {id:$secret,email:$email,alterId:0}
+                else {id:$secret,email:$email} + (if $flow == "" then {} else {flow:$flow} end) end]
+        end
+    ' <<< "$cfg"
+}
+
+# Only write to the caller's staging path.
 generate_xray_config() {
-    local xray_protocols=$(get_xray_protocols)
-    [[ -z "$xray_protocols" ]] && return 1
-    
-    mkdir -p "$CFG"
-    
-    # 确保日志目录存在
-    mkdir -p /var/log/xray
+    local xray_config="$1" nodes node_lines node
+    nodes=$(_xray_db_nodes) || return 1
+    [[ "$nodes" != '[]' ]] || return 1
     
     # 读取直连出口 IP 版本设置（默认 AsIs）
     local direct_ip_version="as_is"
@@ -3380,18 +3392,18 @@ generate_xray_config() {
             inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
             outbounds: $outbounds,
             routing: {domainStrategy: "IPIfNonMatch", rules: [], balancers: $balancers}
-        }' > "$CFG/config.json"
+        }' > "$xray_config"
 
         # 添加路由规则（API 规则放最前面）
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             local api_rule='{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}'
             local all_rules=$(echo "$routing_rules" | jq --argjson api "$api_rule" '[$api] + .')
             local tmp=$(mktemp)
-            jq --argjson rules "$all_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq --argjson rules "$all_rules" '.routing.rules = $rules' "$xray_config" > "$tmp" && mv "$tmp" "$xray_config"
         else
             # 即使没有其他规则，也要添加 API 规则
             local tmp=$(mktemp)
-            jq '.routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq '.routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]' "$xray_config" > "$tmp" && mv "$tmp" "$xray_config"
         fi
 
         # 检查是否使用了leastPing或leastLoad策略,添加burstObservatory配置
@@ -3439,7 +3451,7 @@ generate_xray_config() {
                         timeout: "5s"
                     }
                 }
-            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            ' "$xray_config" > "$tmp" && mv "$tmp" "$xray_config"
         fi
     else
         # 无全局分流规则时，仍然需要检查用户级路由规则和负载均衡器
@@ -3515,13 +3527,13 @@ generate_xray_config() {
                 inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                 outbounds: $outbounds,
                 routing: {domainStrategy: "IPIfNonMatch", rules: $rules, balancers: $balancers}
-            }' > "$CFG/config.json"
+            }' > "$xray_config"
             
             # 添加多IP路由 outbound 支持（routing 规则将在 inbound 添加完成后统一添加）
             local ip_routing_outbounds=$(gen_xray_ip_routing_outbounds)
             if [[ -n "$ip_routing_outbounds" && "$ip_routing_outbounds" != "[]" ]]; then
                 local tmp=$(mktemp)
-                jq --argjson ip_outs "$ip_routing_outbounds" '.outbounds += $ip_outs' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+                jq --argjson ip_outs "$ip_routing_outbounds" '.outbounds += $ip_outs' "$xray_config" > "$tmp" && mv "$tmp" "$xray_config"
             fi
         else
             # 无任何用户路由规则时
@@ -3541,7 +3553,7 @@ generate_xray_config() {
                     inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                     outbounds: $outbounds,
                     routing: {domainStrategy: "IPIfNonMatch", rules: [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
-                }' > "$CFG/config.json"
+                }' > "$xray_config"
             else
                 # 无任何路由规则，使用简单直连配置（仍需要 API 规则）
                 jq -n --argjson direct "$direct_outbound" '{
@@ -3552,70 +3564,38 @@ generate_xray_config() {
                     inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                     outbounds: [$direct, {protocol: "blackhole", tag: "api"}],
                     routing: {domainStrategy: "IPIfNonMatch", rules: [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
-                }' > "$CFG/config.json"
+                }' > "$xray_config"
             fi
         fi
     fi
     
-    # 为每个 Xray 协议添加 inbound，并统计成功数量
-    local success_count=0
-    local failed_protocols=""
-    local p
-    for p in $xray_protocols; do
-        # 获取协议配置
-        local cfg=$(db_get "xray" "$p")
-
-        # 检查是否为多端口数组
-        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            # 多端口模式：为每个端口创建临时单端口配置
-            local port_count=$(echo "$cfg" | jq 'length')
-            local i=0
-            local port_success=0
-
-            while [[ $i -lt $port_count ]]; do
-                local single_cfg=$(echo "$cfg" | jq ".[$i]")
-                local port=$(echo "$single_cfg" | jq -r '.port')
-
-                # 临时存储单端口配置
-                local tmp_protocol="${p}_port_${port}"
-                db_add "xray" "$tmp_protocol" "$single_cfg"
-
-                # 调用原有函数处理
-                if add_xray_inbound_v2 "$tmp_protocol"; then
-                    ((port_success++))
-                fi
-
-                # 清理临时配置
-                db_del "xray" "$tmp_protocol"
-
-                ((i++))
-            done
-
-            if [[ $port_success -gt 0 ]]; then
-                ((success_count++))
-            else
-                _warn "协议 $p 配置生成失败，跳过"
-                failed_protocols+="$p "
-            fi
-        else
-            # 单端口模式：使用原有逻辑
-            if add_xray_inbound_v2 "$p"; then
-                ((success_count++))
-            else
-                _warn "协议 $p 配置生成失败，跳过"
-                failed_protocols+="$p "
-            fi
-        fi
-    done
-    
-    # 检查是否至少有一个 inbound 成功添加
-    if [[ $success_count -eq 0 ]]; then
-        _err "没有任何协议配置成功生成"
+    local p cfg tag has_master fallbacks
+    has_master=$(jq -r 'any(.[]; (.protocol=="vless-vision" or .protocol=="trojan") and .config.port==8443)' <<< "$nodes") || return 1
+    fallbacks=$(jq -ce '
+        [{dest:"127.0.0.1:80",xver:0}] + [ .[] |
+            select(.protocol=="vless-ws" or .protocol=="vmess-ws" or .protocol=="trojan-ws") | .config |
+            select((.path // "") != "") | (.listen_port // .port) as $port |
+            {path:.path, dest:(if (.listen_addr // .listen // "127.0.0.1") == "127.0.0.1" then $port
+                  elif (.listen_addr // .listen) | contains(":") then "[\(.listen_addr // .listen)]:\($port)"
+                  else "\(.listen_addr // .listen):\($port)" end),xver:0}]
+    ' <<< "$nodes") || return 1
+    if [[ "$has_master" == true ]] && ! jq -e '
+        [.[].path | select(. != null)] | length == (unique | length)
+    ' <<< "$fallbacks" >/dev/null; then
+        _err "Xray 回落节点的 WebSocket 路径重复，请使用不同路径"
         return 1
     fi
+    node_lines=$(jq -c '.[]' <<< "$nodes") || return 1
+    while IFS= read -r node; do
+        p=$(jq -r '.protocol' <<< "$node") && cfg=$(jq -c '.config' <<< "$node") && tag=$(jq -r '.tag' <<< "$node") || return 1
+        if ! add_xray_inbound_v2 "$p" "$cfg" "$tag" "$xray_config" "$has_master" "$fallbacks"; then
+            _err "Xray 节点 $tag 配置生成失败"
+            return 1
+        fi
+    done <<< "$node_lines"
 
     # 最终净化 Xray 不支持的 tracker/geosite 规则（仅影响 Xray；Sing-box 保留对应限制）
-    if [[ -f "$CFG/config.json" ]]; then
+    if [[ -f "$xray_config" ]]; then
         local tmp=$(mktemp)
         if jq '
             if .routing and .routing.rules then
@@ -3632,21 +3612,21 @@ generate_xray_config() {
                     )
                 ]
             else . end
-        ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$CFG/config.json"
+        ' "$xray_config" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$xray_config"
         else
             rm -f "$tmp"
         fi
     fi
     
     # 验证最终配置文件的 JSON 格式
-    if ! jq empty "$CFG/config.json" 2>/dev/null; then
+    if ! jq empty "$xray_config" 2>/dev/null; then
         _err "生成的 Xray 配置文件 JSON 格式错误"
         return 1
     fi
     
     # 检查 inbounds 数组是否为空
-    local inbound_count=$(jq '.inbounds | length' "$CFG/config.json" 2>/dev/null)
+    local inbound_count=$(jq '.inbounds | length' "$xray_config" 2>/dev/null)
     if [[ "$inbound_count" == "0" || -z "$inbound_count" ]]; then
         _err "Xray 配置中没有有效的 inbound"
         return 1
@@ -3655,7 +3635,7 @@ generate_xray_config() {
     # 多IP路由：在所有 inbound 添加完成后，更新 routing 规则
     # 因为 routing 规则需要知道实际生成的 inbound tag
     if db_ip_routing_enabled; then
-        local inbounds_json=$(jq '.inbounds' "$CFG/config.json" 2>/dev/null || echo "[]")
+        local inbounds_json=$(jq '.inbounds' "$xray_config" 2>/dev/null || echo "[]")
         local ip_routing_rules=$(gen_xray_ip_routing_rules "$inbounds_json")
         
         if [[ -n "$ip_routing_rules" && "$ip_routing_rules" != "[]" ]]; then
@@ -3665,119 +3645,35 @@ generate_xray_config() {
                 .routing.rules = (
                     [.routing.rules[0]] + $ip_rules + .routing.rules[1:]
                 )
-            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            ' "$xray_config" > "$tmp" && mv "$tmp" "$xray_config"
         fi
     fi
     
-    if [[ -n "$failed_protocols" ]]; then
-        _warn "以下协议配置失败: $failed_protocols"
-    fi
-    
-    _ok "Xray 配置生成成功 ($success_count 个协议)"
+    local final="${xray_config}.final" logdir="${XRAY_LOG_DIR:-/var/log/xray}"
+    jq -e --arg logdir "$logdir" --argjson nodes "$nodes" '
+        .inbounds as $inbounds |
+        if all($nodes[]; .tag as $tag | any($inbounds[]; .tag == $tag)) and
+           (($inbounds | map(.tag) | unique | length) == ($inbounds | length)) then
+            .log.access = ($logdir + "/access.log") | .log.error = ($logdir + "/error.log")
+        else error("Xray config has missing or duplicate inbounds") end
+    ' "$xray_config" > "$final" && mv -f -- "$final" "$xray_config" || return 1
     return 0
 }
 
-# 处理单个端口实例的 inbound 生成
-# 参数: $1=protocol, $2=config_json
-_add_single_xray_inbound() {
-    local protocol="$1"
-    local cfg="$2"
-    
-    # 从配置中提取字段
-    local port=$(echo "$cfg" | jq -r '.port // empty')
-    [[ -z "$port" ]] && return 1
-    
-    # 调用原有的 inbound 生成逻辑
-    # 这里暂时返回成功，后续会补充完整逻辑
-    return 0
-}
-
-# 使用 jq 动态构建 inbound (重构版 - 只从数据库读取)
 add_xray_inbound_v2() {
-    local protocol=$1
-    
-    # 从数据库读取配置
-    local cfg=""
-    if db_exists "xray" "$protocol"; then
-        cfg=$(db_get "xray" "$protocol")
-    else
-        _err "协议 $protocol 在数据库中不存在 (xray 分类)"
-        return 1
-    fi
-    
-    [[ -z "$cfg" ]] && { _err "协议 $protocol 配置为空"; return 1; }
-    
-    # 提取基础协议名（去掉 _port_xxx 后缀）
-    local base_protocol="$protocol"
-    if [[ "$protocol" =~ ^(.+)_port_[0-9]+$ ]]; then
-        base_protocol="${BASH_REMATCH[1]}"
-    fi
-    
-    # 从配置中提取字段
-    local port=$(echo "$cfg" | jq -r '.port // empty')
-    local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
-    local sni=$(echo "$cfg" | jq -r '.sni // empty')
-    local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
-    local private_key=$(echo "$cfg" | jq -r '.private_key // empty')
-    local path=$(echo "$cfg" | jq -r '.path // empty')
-    local password=$(echo "$cfg" | jq -r '.password // empty')
-    local username=$(echo "$cfg" | jq -r '.username // empty')
-    local method=$(echo "$cfg" | jq -r '.method // empty')
-    
-    [[ -z "$port" ]] && return 1
-
-    # 生成唯一的 inbound tag（基础协议名 + 端口）
-    local inbound_tag="${base_protocol}-${port}"
-    
-    # 检测主协议和回落配置（仅当主协议端口为 8443 时才启用回落模式）
-    local has_master=false
-    local master_port=""
-    for proto in vless-vision trojan; do
-        if db_exists "xray" "$proto"; then
-            master_port=$(db_get_field "xray" "$proto" "port" 2>/dev/null)
-            if [[ "$master_port" == "8443" ]]; then
-                has_master=true
-                break
-            fi
-        fi
-    done
-    
-    # 构建回落数组
-    local fallbacks='[{"dest":"127.0.0.1:80","xver":0}]'
-    local ws_port="" ws_path="" vmess_port="" vmess_path="" trojan_ws_port="" trojan_ws_path=""
-    
-    # 检查 vless-ws 回落
-    if db_exists "xray" "vless-ws"; then
-        ws_port=$(db_get_field "xray" "vless-ws" "port")
-        ws_path=$(db_get_field "xray" "vless-ws" "path")
-    fi
-    
-    # 检查 vmess-ws 回落
-    if db_exists "xray" "vmess-ws"; then
-        vmess_port=$(db_get_field "xray" "vmess-ws" "port")
-        vmess_path=$(db_get_field "xray" "vmess-ws" "path")
-    fi
-    
-    # 检查 trojan-ws 回落
-    if db_exists "xray" "trojan-ws"; then
-        trojan_ws_port=$(db_get_field "xray" "trojan-ws" "port")
-        trojan_ws_path=$(db_get_field "xray" "trojan-ws" "path")
-    fi
-    
-    # 使用 jq 构建回落数组
-    if [[ -n "$ws_port" && -n "$ws_path" ]]; then
-        fallbacks=$(echo "$fallbacks" | jq --arg p "$ws_path" --argjson d "$ws_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
-    fi
-    if [[ -n "$vmess_port" && -n "$vmess_path" ]]; then
-        fallbacks=$(echo "$fallbacks" | jq --arg p "$vmess_path" --argjson d "$vmess_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
-    fi
-    if [[ -n "$trojan_ws_port" && -n "$trojan_ws_path" ]]; then
-        fallbacks=$(echo "$fallbacks" | jq --arg p "$trojan_ws_path" --argjson d "$trojan_ws_port" '. += [{"path":$p,"dest":$d,"xver":0}]')
-    fi
-    
-    local inbound_json=""
-    local tmp_inbound=$(mktemp)
-    
+    local base_protocol="$1" cfg="$2" inbound_tag="$3" xray_config="$4" has_master="$5" fallbacks="$6"
+    local port sni short_id private_key path password method listen_addr explicit_listen explicit_port tmp_inbound
+    port=$(jq -r '.listen_port // .port' <<< "$cfg") || return 1
+    sni=$(jq -r '.sni // empty' <<< "$cfg") || return 1
+    short_id=$(jq -r '.short_id // empty' <<< "$cfg") || return 1
+    private_key=$(jq -r '.private_key // empty' <<< "$cfg") || return 1
+    path=$(jq -r '.path // empty' <<< "$cfg") || return 1
+    password=$(jq -r '.password // empty' <<< "$cfg") || return 1
+    method=$(jq -r '.method // empty' <<< "$cfg") || return 1
+    explicit_listen=$(jq -er '(.listen_addr // .listen // "") | strings' <<< "$cfg") || return 1
+    explicit_port=$(jq -r '.listen_port // empty' <<< "$cfg") || return 1
+    listen_addr=$(_listen_addr)
+    tmp_inbound="${xray_config}.inbound"
     # 检测是否使用真实证书 (Reality 需要特殊处理 dest)
     local reality_dest="${sni}:443"
     local cert_domain=""
@@ -3788,8 +3684,6 @@ add_xray_inbound_v2() {
         # 真实证书模式，dest 必须指向本地 Nginx HTTPS (固定 8443)
         reality_dest="127.0.0.1:8443"
         
-        # 确保 Nginx HTTPS 监听存在 (真实域名模式)
-        _ensure_nginx_https_for_reality "$cert_domain"
     fi
     
     case "$base_protocol" in
@@ -3797,8 +3691,8 @@ add_xray_inbound_v2() {
             local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
             if [[ "$security_mode" == "encryption" ]]; then
                 local decryption=$(echo "$cfg" | jq -r '.decryption // "none"')
-                local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-                [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+                local clients
+                clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
 
                 jq -n \
                     --argjson port "$port" \
@@ -3824,8 +3718,8 @@ add_xray_inbound_v2() {
             else
                 # VLESS+Reality - 使用 jq 安全构建 (支持 WS 回落)
                 # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-                local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-                [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
+                local clients
+                clients=$(_xray_node_accounts "$base_protocol" "$cfg" "xtls-rprx-vision") || return 1
                 
                 jq -n \
                     --argjson port "$port" \
@@ -3866,8 +3760,8 @@ add_xray_inbound_v2() {
         vless-vision)
             # VLESS-Vision - 使用 jq 安全构建
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "xtls-rprx-vision") || return 1
             
             jq -n \
                 --argjson port "$port" \
@@ -3902,8 +3796,8 @@ add_xray_inbound_v2() {
         vless-ws)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             # vless-ws 不需要 flow
-            local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             if [[ "$has_master" == "true" ]]; then
                 # 回落模式：监听本地
@@ -3962,11 +3856,11 @@ add_xray_inbound_v2() {
             ;;
         vless-ws-notls)
             # VLESS-WS 无 TLS - 专为 CF Tunnel 设计
-            local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             # 从数据库获取 host 配置
-            local host=$(db_get_field "xray" "$base_protocol" "host")
+            local host=$(jq -r '.host // empty' <<< "$cfg")
             [[ -z "$host" ]] && host=""
             
             jq -n \
@@ -3992,8 +3886,8 @@ add_xray_inbound_v2() {
             ;;
         vless-xhttp)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             jq -n \
                 --argjson port "$port" \
@@ -4030,11 +3924,11 @@ add_xray_inbound_v2() {
         vless-xhttp-cdn)
             # VLESS+XHTTP+TLS+CDN 模式 - Nginx 反代 h2c，无 Reality
             local domain=$(echo "$cfg" | jq -r '.domain // empty')
-            local internal_port=$(echo "$cfg" | jq -r '.internal_port // .port')
+            local internal_port=$(echo "$cfg" | jq -r '.listen_port // .internal_port // .port')
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             jq -n \
                 --argjson port "$internal_port" \
@@ -4057,8 +3951,8 @@ add_xray_inbound_v2() {
             ;;
         vmess-ws)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vmess_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"alterId\":0}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             if [[ "$has_master" == "true" ]]; then
                 jq -n \
@@ -4109,8 +4003,8 @@ add_xray_inbound_v2() {
             ;;
         trojan)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_trojan_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             jq -n \
                 --argjson port "$port" \
@@ -4141,11 +4035,11 @@ add_xray_inbound_v2() {
             local sni=$(echo "$cfg" | jq -r '.sni // "bing.com"')
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_trojan_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            local clients
+            clients=$(_xray_node_accounts "$base_protocol" "$cfg" "") || return 1
             
             # Trojan-WS 作为回落协议或独立运行
-            if _has_master_protocol; then
+            if [[ "$has_master" == true ]]; then
                 # 作为主协议的回落，监听本地端口
                 jq -n \
                     --argjson port "$port" \
@@ -4202,13 +4096,14 @@ add_xray_inbound_v2() {
             local socks_listen_addr="${listen_addr:-}"
             [[ -z "$socks_listen_addr" ]] && socks_listen_addr=$(_listen_addr)
             [[ -n "$config_listen_addr" ]] && socks_listen_addr="$config_listen_addr"
+            local accounts
+            accounts=$(_xray_node_accounts "$base_protocol" "$cfg") || return 1
             
             if [[ "$use_tls" == "true" ]]; then
                 # SOCKS5 + TLS
                 jq -n \
                     --argjson port "$port" \
-                    --arg username "$username" \
-                    --arg password "$password" \
+                    --argjson accounts "$accounts" \
                     --arg cert "$CFG/certs/server.crt" \
                     --arg key "$CFG/certs/server.key" \
                     --arg tag "$inbound_tag" \
@@ -4221,7 +4116,7 @@ add_xray_inbound_v2() {
                     settings: ({
                         auth: $auth_mode,
                         udp: true
-                    } + (if $auth_mode == "noauth" then {} else {accounts: [{user: $username, pass: $password}]} end)),
+                    } + (if $auth_mode == "noauth" then {} else {accounts: $accounts} end)),
                     streamSettings: {
                         network: "tcp",
                         security: "tls",
@@ -4235,8 +4130,7 @@ add_xray_inbound_v2() {
                 # SOCKS5 无 TLS
                 jq -n \
                     --argjson port "$port" \
-                    --arg username "$username" \
-                    --arg password "$password" \
+                    --argjson accounts "$accounts" \
                     --arg tag "$inbound_tag" \
                     --arg listen_addr "$socks_listen_addr" \
                     --arg auth_mode "$auth_mode" \
@@ -4247,7 +4141,7 @@ add_xray_inbound_v2() {
                     settings: ({
                         auth: $auth_mode,
                         udp: true
-                    } + (if $auth_mode == "noauth" then {} else {accounts: [{user: $username, pass: $password}]} end)),
+                    } + (if $auth_mode == "noauth" then {} else {accounts: $accounts} end)),
                     tag: $tag
                 }' > "$tmp_inbound"
             fi
@@ -4277,26 +4171,30 @@ add_xray_inbound_v2() {
             ;;
     esac
     
-    # 验证生成的 inbound JSON
-    if ! jq empty "$tmp_inbound" 2>/dev/null; then
-        _err "生成的 $protocol inbound JSON 格式错误"
+    local adjusted="${tmp_inbound}.adjusted"
+    if ! jq -e --arg listen "$explicit_listen" --arg port "$explicit_port" '
+        select(type == "object" and (.tag | type) == "string") |
+        if $listen != "" then .listen = $listen else . end |
+        if $port != "" then .port = ($port | tonumber) else . end
+    ' "$tmp_inbound" > "$adjusted" || ! mv -f -- "$adjusted" "$tmp_inbound"; then
+        _err "生成的 $base_protocol inbound JSON 格式错误"
         rm -f "$tmp_inbound"
         return 1
     fi
     
     # 合并到主配置
     local tmp_config=$(mktemp)
-    if jq '.inbounds += [input]' "$CFG/config.json" "$tmp_inbound" > "$tmp_config" 2>/dev/null; then
-        mv "$tmp_config" "$CFG/config.json"
+    if jq '.inbounds += [input]' "$xray_config" "$tmp_inbound" > "$tmp_config" 2>/dev/null; then
+        mv -f -- "$tmp_config" "$xray_config" || return 1
     else
-        _err "合并 $protocol 配置失败"
+        _err "合并 $base_protocol 配置失败"
         rm -f "$tmp_inbound" "$tmp_config"
         return 1
     fi
     
     # 多IP路由支持：为每个配置的入站IP创建独立的 inbound 副本
     # 这样 routing 规则可以通过 inboundTag 匹配到正确的出站
-    if db_ip_routing_enabled; then
+    if [[ -z "$explicit_listen" ]] && db_ip_routing_enabled; then
         local ip_rules=$(db_get_ip_routing_rules)
         if [[ -n "$ip_rules" && "$ip_rules" != "[]" ]]; then
             while IFS= read -r rule; do
@@ -4306,7 +4204,7 @@ add_xray_inbound_v2() {
                 
                 # 为该入站IP创建专用的 inbound 副本
                 # tag 需要包含端口号，避免多协议时 tag 冲突
-                local ip_tag="ip-in-${inbound_ip//[.:]/-}-${port}"
+                local ip_tag="ip-in-${inbound_ip//[.:]/-}-${inbound_tag}"
                 local ip_inbound_file=$(mktemp)
                 
                 # 复制原始 inbound，修改 listen 和 tag
@@ -4315,8 +4213,8 @@ add_xray_inbound_v2() {
                 
                 if jq empty "$ip_inbound_file" 2>/dev/null; then
                     local tmp2=$(mktemp)
-                    if jq '.inbounds += [input]' "$CFG/config.json" "$ip_inbound_file" > "$tmp2" 2>/dev/null; then
-                        mv "$tmp2" "$CFG/config.json"
+                    if jq '.inbounds += [input]' "$xray_config" "$ip_inbound_file" > "$tmp2" 2>/dev/null; then
+                        mv "$tmp2" "$xray_config"
                     fi
                     rm -f "$tmp2"
                 fi
@@ -4327,6 +4225,134 @@ add_xray_inbound_v2() {
     
     rm -f "$tmp_inbound"
     return 0
+}
+
+_xray_service_ready() {
+    sleep 1
+    if [[ "${DISTRO:-}" == alpine ]]; then
+        rc-service vless-reality status >/dev/null 2>&1
+    else
+        [[ $(systemctl is-active vless-reality 2>/dev/null) == active ]]
+    fi
+}
+
+_apply_xray_config() {
+    local mode="${1:-active}" db_backup="${2:-}" service_proto="${3:-}"
+    local live="$CFG/config.json" stage running=false action="" restored=true
+    mkdir -p "$CFG" || return 1
+    stage=$(mktemp -d "$CFG/.xray.XXXXXXXX") || return 1
+    if [[ "$mode" != remove ]]; then
+        if ! generate_xray_config "$stage/config.json" ||
+           ! mkdir -p "${XRAY_LOG_DIR:-/var/log/xray}" ||
+           ! xray run -test -c "$stage/config.json"; then
+            _err "Xray 配置生成或校验失败，保留原运行配置"
+            rm -rf -- "$stage"
+            return 1
+        fi
+    fi
+    if [[ -e "$live" ]] && ! cp -p -- "$live" "$stage/config.old"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    if svc status vless-reality >/dev/null 2>&1; then
+        running=true
+        action=restart
+    elif [[ "$mode" == start ]]; then
+        action=start
+    fi
+    if [[ "$mode" == remove ]]; then
+        if { ! $running || svc stop vless-reality; } && rm -f -- "$live"; then
+            svc disable vless-reality >/dev/null 2>&1 || true
+            rm -rf -- "$stage"
+            return 0
+        fi
+    else
+        if [[ "$action" == start && -n "$service_proto" ]]; then
+            if ! create_server_scripts || ! create_service "$service_proto"; then
+                rm -rf -- "$stage"
+                return 1
+            fi
+        fi
+        # Prepare the managed Nginx fallback only after the Xray candidate is valid.
+        if jq -e 'any(.inbounds[]; .streamSettings.realitySettings.dest == "127.0.0.1:8443")' "$stage/config.json" >/dev/null && [[ -s "$CFG/cert_domain" ]]; then
+            _ensure_nginx_https_for_reality "$(<"$CFG/cert_domain")" || true
+        fi
+        if ! mv -f -- "$stage/config.json" "$live"; then
+            rm -rf -- "$stage"
+            return 1
+        fi
+        if [[ -z "$action" ]] || { svc "$action" vless-reality && _xray_service_ready; }; then
+            if [[ "$mode" == start ]]; then svc enable vless-reality >/dev/null 2>&1 || true; fi
+            rm -rf -- "$stage"
+            return 0
+        fi
+    fi
+    if [[ -n "$db_backup" ]]; then mv -f -- "$db_backup" "$DB_FILE" || restored=false; fi
+    if [[ -e "$stage/config.old" ]]; then
+        mv -f -- "$stage/config.old" "$live" || restored=false
+    else
+        rm -f -- "$live" || restored=false
+    fi
+    if $running; then
+        if [[ "$mode" != remove ]] || ! svc status vless-reality >/dev/null 2>&1; then
+            svc restart vless-reality && _xray_service_ready || restored=false
+        fi
+    elif svc status vless-reality >/dev/null 2>&1; then
+        svc stop vless-reality || restored=false
+    fi
+    if $restored; then
+        _err "Xray 应用失败，已恢复原配置和服务状态"
+        rm -rf -- "$stage"
+    else
+        _err "Xray 应用失败，未能完整恢复；暂存目录: $stage"
+    fi
+    return 1
+}
+
+_change_xray_nodes() {
+    local op="$1" proto="$2" port="$3" cfg="${4:-null}" master="${5:-}" txn nodes mode=start
+    init_db && _xray_db_nodes >/dev/null || return 1
+    txn=$(mktemp -d "$CFG/.xray-db.XXXXXXXX") || return 1
+    if ! cp -p -- "$DB_FILE" "$txn/db.old" || ! jq -e --arg op "$op" --arg p "$proto" --arg port "$port" \
+        --argjson cfg "$cfg" --arg master "$master" '
+        def as_nodes: if type == "array" then . elif . == null then [] else [.] end;
+        def port_number: .port | tonumber;
+        .xray[$p] as $field | ($field | as_nodes) as $nodes |
+        (if $op == "add" then
+            if any($nodes[]; port_number == ($cfg | port_number)) then error("node already exists")
+            elif $nodes == [] then $cfg else $nodes + [$cfg] end
+         elif $op == "delete" and $port == "all" then
+            if $nodes == [] then error("node not found") else [] end
+         elif ([$nodes[] | select(port_number == ($port | tonumber))] | length) != 1 then error("node not found")
+         elif $op == "delete" then [$nodes[] | select(port_number != ($port | tonumber))]
+         elif $op == "replace" then
+            ($nodes | map(if port_number == ($port | tonumber) then . + $cfg else . end)) |
+            if ($field | type) == "array" then . else .[0] end
+         else error("invalid node operation") end) as $next |
+        (if $next == [] then del(.xray[$p]) else .xray[$p] = $next end) |
+        if $master != "" then
+            .xray[$master] |= (as_nodes | map(select(port_number != ($cfg | port_number)))) |
+            if .xray[$master] == [] then del(.xray[$master]) else . end
+        else . end
+    ' "$DB_FILE" > "$txn/db.next" || ! nodes=$(_xray_db_nodes "$txn/db.next") ||
+       ! mv -f -- "$txn/db.next" "$DB_FILE"; then
+        rm -rf -- "$txn"
+        return 1
+    fi
+    if [[ "$op" == delete ]]; then
+        mode=active
+        [[ "$nodes" != '[]' ]] || mode=remove
+    fi
+    if ! _apply_xray_config "$mode" "$txn/db.old" "$proto"; then
+        if [[ -f "$txn/db.old" ]] && ! mv -f -- "$txn/db.old" "$DB_FILE"; then
+            _err "Xray 节点数据库回滚失败，备份: $txn/db.old"
+            return 1
+        fi
+        rm -rf -- "$txn"
+        return 1
+    fi
+    rm -rf -- "$txn"
+    _sync_tunnel_config preserve_xray 2>/dev/null || true
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -5146,7 +5172,7 @@ check_port_conflict() {
     
     # 检查 xray 协议
     for proto in $(db_list_protocols "xray"); do
-        [[ "$proto" == "$current_protocol" && "$current_core" == "xray" ]] && continue
+        [[ "$current_core" == xray && ( "$proto" == "$current_protocol" || "$proto" == "${replace_xray_master:-}" ) ]] && continue
         
         local ports=$(db_list_ports "xray" "$proto")
         if echo "$ports" | grep -q "^${check_port}$"; then
@@ -6663,17 +6689,8 @@ setup_cert_and_nginx() {
     
     # === 回落子协议检测：如果是 WS 协议且主协议在 8443 端口，跳过 Nginx 配置 ===
     local is_fallback_mode=false
-    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]]; then
-        local master_port=""
-        for proto in vless-vision trojan; do
-            if db_exists "xray" "$proto"; then
-                master_port=$(db_get_field "xray" "$proto" "port" 2>/dev/null)
-                if [[ "$master_port" == "8443" ]]; then
-                    is_fallback_mode=true
-                    break
-                fi
-            fi
-        done
+    if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]] && _has_master_protocol; then
+        is_fallback_mode=true
     fi
     
     # 检测是否已有证书
@@ -10426,7 +10443,7 @@ gen_server_config() {
     
     register_protocol "vless" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni" security_mode "reality")"
+        public_key "$pubkey" short_id "$sid" sni "$sni" security_mode "reality")" || return 1
     
     _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
         "gen_vless_link %s $port $uuid $pubkey $sid $sni"
@@ -10440,7 +10457,7 @@ gen_vless_encryption_server_config() {
 
     register_protocol "vless" "$(build_config \
         uuid "$uuid" port "$port" decryption "$decryption" \
-        encryption "$encryption" security_mode "encryption")"
+        encryption "$encryption" security_mode "encryption")" || return 1
 
     _save_join_info "vless" "VLESS-ENCRYPTION|%s|$port|$uuid|$encryption" \
         "gen_vless_encryption_link %s $port $uuid $encryption"
@@ -10454,7 +10471,7 @@ gen_vless_xhttp_server_config() {
     
     register_protocol "vless-xhttp" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni" path "$path")"
+        public_key "$pubkey" short_id "$sid" sni "$sni" path "$path")" || return 1
     
     _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$pubkey|$sid|$sni|$path" \
         "gen_vless_xhttp_link %s $port $uuid $pubkey $sid $sni $path"
@@ -10523,7 +10540,7 @@ gen_trojan_server_config() {
     
     [[ ! -f "$CFG/certs/server.crt" ]] && gen_self_cert "$sni"
 
-    register_protocol "trojan" "$(build_config password "$password" port "$port" sni "$sni")"
+    register_protocol "trojan" "$(build_config password "$password" port "$port" sni "$sni")" || return 1
     _save_join_info "trojan" "TROJAN|%s|$port|$password|$sni" \
         "gen_trojan_link %s $port $password $sni"
     echo "server" > "$CFG/role"
@@ -10538,7 +10555,7 @@ gen_trojan_ws_server_config() {
     _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
 
     register_protocol "trojan-ws" "$(build_config \
-        password "$password" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+        password "$password" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
     _save_join_info "trojan-ws" "TROJAN-WS|%s|$outer_port|$password|$sni|$path" \
         "gen_trojan_ws_link %s $outer_port $password $sni $path"
     echo "server" > "$CFG/role"
@@ -10553,7 +10570,7 @@ gen_vless_ws_server_config() {
     _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
 
     register_protocol "vless-ws" "$(build_config \
-        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
     _save_join_info "vless-ws" "VLESS-WS|%s|$outer_port|$uuid|$sni|$path" \
         "gen_vless_ws_link %s $outer_port $uuid $sni $path"
     echo "server" > "$CFG/role"
@@ -10566,7 +10583,7 @@ gen_vless_ws_notls_server_config() {
     
     # 无需证书，直接使用外部端口
     register_protocol "vless-ws-notls" "$(build_config \
-        uuid "$uuid" port "$port" path "$path" host "$host")"
+        uuid "$uuid" port "$port" path "$path" host "$host")" || return 1
     _save_join_info "vless-ws-notls" "VLESS-WS-CF|%s|$port|$uuid|$path|$host" \
         "gen_vless_ws_notls_link %s $port $uuid $path $host"
     echo "server" > "$CFG/role"
@@ -10582,7 +10599,7 @@ gen_vmess_ws_server_config() {
     _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
 
     register_protocol "vmess-ws" "$(build_config \
-        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
     _save_join_info "vmess-ws" "VMESSWS|%s|$outer_port|$uuid|$sni|$path" \
         "gen_vmess_ws_link %s $outer_port $uuid $sni $path"
     echo "server" > "$CFG/role"
@@ -10595,7 +10612,7 @@ gen_vless_vision_server_config() {
     
     [[ ! -f "$CFG/certs/server.crt" ]] && gen_self_cert "$sni"
 
-    register_protocol "vless-vision" "$(build_config uuid "$uuid" port "$port" sni "$sni")"
+    register_protocol "vless-vision" "$(build_config uuid "$uuid" port "$port" sni "$sni")" || return 1
     _save_join_info "vless-vision" "VLESS-VISION|%s|$port|$uuid|$sni" \
         "gen_vless_vision_link %s $port $uuid $sni"
     echo "server" > "$CFG/role"
@@ -10606,7 +10623,7 @@ gen_ss2022_server_config() {
     local password="$1" port="$2" method="${3:-2022-blake3-aes-128-gcm}"
     mkdir -p "$CFG"
 
-    register_protocol "ss2022" "$(build_config password "$password" port "$port" method "$method")"
+    register_protocol "ss2022" "$(build_config password "$password" port "$port" method "$method")" || return 1
     _save_join_info "ss2022" "SS2022|%s|$port|$method|$password" \
         "gen_ss2022_link %s $port $method $password"
     echo "server" > "$CFG/role"
@@ -10617,7 +10634,7 @@ gen_ss_legacy_server_config() {
     local password="$1" port="$2" method="${3:-aes-256-gcm}"
     mkdir -p "$CFG"
 
-    register_protocol "ss-legacy" "$(build_config password "$password" port "$port" method "$method")"
+    register_protocol "ss-legacy" "$(build_config password "$password" port "$port" method "$method")" || return 1
     _save_join_info "ss-legacy" "SS|%s|$port|$method|$password" \
         "gen_ss_legacy_link %s $port $method $password"
     echo "server" > "$CFG/role"
@@ -10876,7 +10893,7 @@ gen_socks_server_config() {
     else
         config_json=$(build_config username "$username" password "$password" port "$port" auth_mode "$auth_mode" listen_addr "$listen_addr")
     fi
-    register_protocol "socks" "$config_json"
+    register_protocol "socks" "$config_json" || return 1
 
     # SOCKS5 的 join 信息
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
@@ -11421,8 +11438,7 @@ start_services() {
     # 1. 启动 Xray 服务（TCP 协议）
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        _start_core_service "vless-reality" "xray" "$xray_protocols" "generate_xray_config" || \
-            failed_services+=("vless-reality")
+        _apply_xray_config start || failed_services+=("vless-reality")
     fi
     
     # 2. 启动 Sing-box 服务（UDP/QUIC 协议: Hy2/TUIC）
@@ -13302,7 +13318,7 @@ gen_xray_ip_routing_rules() {
         fi
         
         # 如果没有从参数获取到，尝试从现有配置文件读取
-        if [[ "$matching_tags" == "[]" && -f "$CFG/config.json" ]]; then
+        if [[ -z "$inbounds_json" && -f "$CFG/config.json" ]]; then
             matching_tags=$(jq --arg prefix "$inbound_tag_prefix" '[.inbounds[]? | select(.tag | startswith($prefix)) | .tag]' "$CFG/config.json" 2>/dev/null || echo "[]")
         fi
         
@@ -14339,8 +14355,7 @@ _del_routing_rule() {
 _regenerate_proxy_configs() {
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        generate_xray_config || return 1
-        svc restart vless-reality || return 1
+        _apply_xray_config active || return 1
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
@@ -14546,9 +14561,7 @@ configure_direct_outbound() {
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
         _info "重新生成 Xray 配置..."
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
+        _apply_xray_config active || return 1
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
@@ -14794,9 +14807,7 @@ setup_warp_ipv6_chain() {
     # 重新生成 Xray 配置
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
+        _apply_xray_config active || return 1
         _ok "Xray 配置已更新"
     fi
     
@@ -17798,21 +17809,11 @@ show_single_protocol_info() {
     if [[ "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan-ws" ]]; then
         # 检查是否有 TLS 主协议在 8443 端口 (仅 8443 端口才触发回落显示)
         # 注意：Reality 不支持 WS 回落，只有 Vision/Trojan 可以
-        if db_exists "xray" "vless-vision"; then
-            local master_port=$(db_get_field "xray" "vless-vision" "port" 2>/dev/null)
-            if [[ "$master_port" == "8443" ]]; then
-                display_port="$master_port"
-                is_fallback_protocol=true
-                master_name="Vision"
-            fi
-        fi
-        if [[ "$is_fallback_protocol" == "false" ]] && db_exists "xray" "trojan"; then
-            local master_port=$(db_get_field "xray" "trojan" "port" 2>/dev/null)
-            if [[ "$master_port" == "8443" ]]; then
-                display_port="$master_port"
-                is_fallback_protocol=true
-                master_name="Trojan"
-            fi
+        local master_node
+        if master_node=$(_xray_master_node); then
+            display_port=8443
+            is_fallback_protocol=true
+            master_name=$(jq -r 'if .protocol == "trojan" then "Trojan" else "Vision" end' <<< "$master_node")
         fi
     fi
     
@@ -18664,55 +18665,18 @@ uninstall_specific_protocol() {
     
     # 停止相关服务
     if [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
-        # Xray 协议：需要重新生成配置
-        # 根据选择的端口进行卸载
-        if [[ "$SELECTED_PORT" == "all" ]]; then
-            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
+        _change_xray_nodes delete "$selected_protocol" "$SELECTED_PORT" || {
+            _err "删除 Xray 节点失败"
+            _pause
+            return 1
+        }
+        if ! db_exists xray "$selected_protocol"; then
             rm -f "$CFG/${selected_protocol}.join"
-        else
-            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
-            
-            # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
-                
-                # 检查是否还有其他端口实例
-                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
-                if [[ -z "$remaining_ports" ]]; then
-                    # 没有剩余端口，完全卸载
-                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
-                    rm -f "$CFG/${selected_protocol}.join"
-                else
-                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
-                fi
-            else
-                # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join"
-            fi
         fi
-        
-        # 检查是否还有其他 Xray 协议
-        local remaining_xray=$(get_xray_protocols)
-        if [[ -n "$remaining_xray" ]]; then
-            _info "重新生成 Xray 配置..."
-            svc stop vless-reality 2>/dev/null
-            rm -f "$CFG/config.json"
-            
-            if generate_xray_config; then
-                _ok "Xray 配置已更新"
-                svc start vless-reality
-            else
-                _err "Xray 配置生成失败"
-            fi
-        else
-            _info "没有其他 Xray 协议，停止 Xray 服务..."
-            svc stop vless-reality 2>/dev/null
-            rm -f "$CFG/config.json"
-            _ok "Xray 服务已停止"
-        fi
+        [[ ! -f "$CFG/sub.info" ]] || generate_sub_files
+        _ok "Xray 节点已卸载"
+        _pause
+        return 0
     elif [[ " $SINGBOX_PROTOCOLS " == *" $selected_protocol "* ]]; then
         _change_singbox_nodes delete "$selected_protocol" "$SELECTED_PORT" || {
             _err "删除 Sing-box 节点失败"
@@ -19250,7 +19214,7 @@ do_install_server() {
 
     # === 主协议冲突检测 ===
     # Vision 和 Trojan 都是 443 端口主协议，不能同时安装
-    local master_protocols="vless-vision trojan"
+    local master_protocols="vless-vision trojan" replace_xray_master=""
     if echo "$master_protocols" | grep -qw "$protocol"; then
         local existing_master=""
         local existing_master_name=""
@@ -19271,7 +19235,7 @@ do_install_server() {
             echo -e "  ${Y}它们不能同时作为主协议运行${NC}"
             echo ""
             echo -e "  ${W}选项：${NC}"
-            echo -e "  1) 卸载 $existing_master_name，安装 $(get_protocol_name $protocol)"
+            echo -e "  1) 用 $(get_protocol_name $protocol) 替换 $existing_master_name 的同端口节点"
             echo -e "  2) 使用其他端口安装 $(get_protocol_name $protocol) (非标准端口)"
             echo -e "  3) 取消安装"
             echo ""
@@ -19280,21 +19244,7 @@ do_install_server() {
                 read -rp "  请选择 [1-3]: " master_choice
                 case "$master_choice" in
                     1)
-                        _info "卸载 $existing_master_name..."
-                        unregister_protocol "$existing_master"
-                        rm -f "$CFG/${existing_master}.join"
-                        # 重新生成 Xray 配置
-                        local remaining_xray=$(get_xray_protocols)
-                        if [[ -n "$remaining_xray" ]]; then
-                            svc stop vless-reality 2>/dev/null
-                            rm -f "$CFG/config.json"
-                            generate_xray_config
-                            svc start vless-reality 2>/dev/null
-                        else
-                            svc stop vless-reality 2>/dev/null
-                            rm -f "$CFG/config.json"
-                        fi
-                        _ok "$existing_master_name 已卸载"
+                        replace_xray_master="$existing_master"
                         break
                         ;;
                     2)
@@ -19402,7 +19352,7 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
 
                 _info "生成配置..."
-                gen_vless_encryption_server_config "$uuid" "$port" "$decryption_config" "$encryption_config"
+                gen_vless_encryption_server_config "$uuid" "$port" "$decryption_config" "$encryption_config" || return 1
             else
                 local uuid=$(gen_uuid) sid=$(gen_sid)
                 local keys=$(xray x25519 2>/dev/null)
@@ -19439,7 +19389,7 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
                 _info "生成配置..."
-                gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni"
+                gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni" || return 1
             fi
             ;;
         vless-xhttp)
@@ -19498,7 +19448,7 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
                 _info "生成配置..."
-                gen_vless_xhttp_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni" "$path"
+                gen_vless_xhttp_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni" "$path" || return 1
             else
                 # TLS+CDN 模式
                 echo ""
@@ -19562,7 +19512,7 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
                 _info "生成配置..."
-                gen_vless_xhttp_tls_cdn_config "$uuid" "$internal_port" "$path" "$domain"
+                gen_vless_xhttp_tls_cdn_config "$uuid" "$internal_port" "$path" "$domain" || return 1
                 
                 # 切换协议为 vless-xhttp-cdn (用于后续显示配置信息)
                 protocol="vless-xhttp-cdn"
@@ -19625,7 +19575,7 @@ do_install_server() {
                     [[ "$confirm" =~ ^[nN]$ ]] && return
                     
                     _info "生成配置..."
-                    gen_vless_ws_notls_server_config "$uuid" "$port" "$path" "$host"
+                    gen_vless_ws_notls_server_config "$uuid" "$port" "$path" "$host" || return 1
                     ;;  # 结束 CF Tunnel 分支，进入外层 vless-ws case 结束
             esac
             
@@ -19635,19 +19585,11 @@ do_install_server() {
                 local uuid=$(gen_uuid) path="/vless"
                 
                 # 检查是否有主协议在 8443 端口（仅 8443 端口才作为回落）
-                local master_domain=""
-                local master_protocol=""
-                local master_port=""
-                for proto in vless vless-vision trojan; do
-                    if db_exists "xray" "$proto"; then
-                        master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
-                        if [[ "$master_port" == "8443" ]]; then
-                            master_domain=$(db_get_field "xray" "$proto" "sni" 2>/dev/null)
-                            master_protocol="$proto"
-                            break
-                        fi
-                    fi
-                done
+                local master_domain="" master_protocol="" master_node
+                if master_node=$(_xray_master_node); then
+                    master_protocol=$(jq -r '.protocol' <<< "$master_node")
+                    master_domain=$(jq -r '.config.sni // empty' <<< "$master_node")
+                fi
                 
                 # 检查证书域名
                 local cert_domain=""
@@ -19709,26 +19651,18 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
                 _info "生成配置..."
-                gen_vless_ws_server_config "$uuid" "$port" "$final_sni" "$path"
+                gen_vless_ws_server_config "$uuid" "$port" "$final_sni" "$path" || return 1
             fi
             ;;
         vmess-ws)
             local uuid=$(gen_uuid)
 
             # 检查是否有主协议在 8443 端口（仅 8443 端口才作为回落）
-            local master_domain=""
-            local master_protocol=""
-            local master_port=""
-            for proto in vless vless-vision trojan; do
-                if db_exists "xray" "$proto"; then
-                    master_port=$(db_get_port "xray" "$proto" 2>/dev/null)
-                    if [[ "$master_port" == "8443" ]]; then
-                        master_domain=$(db_get_field "xray" "$proto" "sni" 2>/dev/null)
-                        master_protocol="$proto"
-                        break
-                    fi
-                fi
-            done
+            local master_domain="" master_protocol="" master_node
+            if master_node=$(_xray_master_node); then
+                master_protocol=$(jq -r '.protocol' <<< "$master_node")
+                master_domain=$(jq -r '.config.sni // empty' <<< "$master_node")
+            fi
             
             # 检查证书域名
             local cert_domain=""
@@ -19811,7 +19745,7 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
 
             _info "生成配置..."
-            gen_vmess_ws_server_config "$uuid" "$port" "$final_sni" "$path" "$use_new_cert"
+            gen_vmess_ws_server_config "$uuid" "$port" "$final_sni" "$path" "$use_new_cert" || return 1
             ;;
         vless-vision)
             local uuid=$(gen_uuid)
@@ -19842,7 +19776,7 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_vless_vision_server_config "$uuid" "$port" "$final_sni"
+            gen_vless_vision_server_config "$uuid" "$port" "$final_sni" || return 1
             ;;
         socks)
             local use_tls="false" sni=""
@@ -19935,7 +19869,7 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
 
             _info "生成配置..."
-            gen_socks_server_config "$username" "$password" "$port" "$use_tls" "$sni" "$auth_mode" "$listen_addr"
+            gen_socks_server_config "$username" "$password" "$port" "$use_tls" "$sni" "$auth_mode" "$listen_addr" || return 1
             ;;
         ss2022)
             # SS2022 加密方式选择
@@ -20017,7 +19951,7 @@ do_install_server() {
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
                 _info "生成配置..."
-                gen_ss2022_server_config "$password" "$port" "$method"
+                gen_ss2022_server_config "$password" "$port" "$method" || return 1
             fi
             ;;
         ss-legacy)
@@ -20058,7 +19992,7 @@ do_install_server() {
             [[ "$confirm" =~ ^[nN]$ ]] && return
             
             _info "生成配置..."
-            gen_ss_legacy_server_config "$password" "$port" "$method"
+            gen_ss_legacy_server_config "$password" "$port" "$method" || return 1
             ;;
         hy2)
             local password=$(ask_password 16 "Hysteria2密码")
@@ -20180,10 +20114,10 @@ do_install_server() {
             
             _info "生成配置..."
             if [[ "$use_ws" == "true" ]]; then
-                gen_trojan_ws_server_config "$password" "$port" "$final_sni" "$path"
+                gen_trojan_ws_server_config "$password" "$port" "$final_sni" "$path" || return 1
                 protocol="trojan-ws"  # 更新协议名，确保后续查找正确
             else
-                gen_trojan_server_config "$password" "$port" "$final_sni"
+                gen_trojan_server_config "$password" "$port" "$final_sni" || return 1
             fi
             ;;
         snell|snell-v5)
@@ -20421,9 +20355,16 @@ do_install_server() {
     # 保存当前安装的协议名（防止被后续函数中的循环变量覆盖）
     local current_protocol="$protocol"
     local install_ok=false
-    if [[ "$core" == singbox ]]; then
-        # register_protocol already validated and applied the Sing-box change.
+    if [[ "$core" == singbox || "$core" == xray ]]; then
+        # register_protocol already validated and applied this core's change.
         rm -f "$CFG/paused"
+        if [[ -n "$replace_xray_master" ]] && ! db_exists xray "$replace_xray_master"; then
+            rm -f "$CFG/${replace_xray_master}.join"
+        fi
+        if [[ "$core" == xray ]] && ! svc status vless-watchdog >/dev/null 2>&1; then
+            svc enable vless-watchdog 2>/dev/null || true
+            svc start vless-watchdog 2>/dev/null || true
+        fi
         install_ok=true
     else
         _info "创建服务..."
@@ -22875,6 +22816,7 @@ _get_tunnel_hostname() {
 # 同步隧道配置（协议安装后调用）
 # 解决协议配置更新后隧道连接失败的问题
 _sync_tunnel_config() {
+    local mode="${1:-}"
     # 如果没有隧道配置，直接返回
     [[ ! -f "$CLOUDFLARED_DIR/tunnel.info" ]] && return 0
     [[ ! -f "$CLOUDFLARED_CONFIG" ]] && return 0
@@ -22885,7 +22827,7 @@ _sync_tunnel_config() {
     local need_restart=false
     
     # 1. 修复 Host header（如果存在 wsSettings）
-    if [[ -f "$CFG/config.json" ]] && grep -q '"Host":' "$CFG/config.json" 2>/dev/null; then
+    if [[ "$mode" != preserve_xray && -f "$CFG/config.json" ]] && grep -q '"Host":' "$CFG/config.json" 2>/dev/null; then
         # 检查 Host 是否已经为空
         if ! grep -q '"Host": *""' "$CFG/config.json"; then
             # 清空 Host header
@@ -26791,7 +26733,7 @@ main_menu() {
     _check_script_update_async
 
     # 自动同步隧道配置
-    _sync_tunnel_config 2>/dev/null
+    _sync_tunnel_config preserve_xray 2>/dev/null
 
     while true; do
         _header
