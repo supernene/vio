@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.7 [服务端]
+#  多协议代理一键部署脚本 v3.5.8 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Zyx0rx/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.7"
+readonly VERSION="3.5.8"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/supernene/vio"
 readonly SCRIPT_REPO="supernene/vio"
@@ -11514,7 +11514,7 @@ start_services() {
     return 0
 }
 
-ensure_singbox_runtime_consistency() {
+check_singbox_runtime_consistency() {
     local nodes
     [[ -f "$DB_FILE" ]] || return 0
     check_cmd sing-box || return 0
@@ -11523,19 +11523,15 @@ ensure_singbox_runtime_consistency() {
 
     # An old file can pass check while one protocol's array was skipped entirely.
     # Accept legacy single-node tags when the listener already matches.
-    if ! jq -e --argjson nodes "$nodes" '
+    jq -e --argjson nodes "$nodes" '
         .inbounds as $inbounds |
         all($nodes[]; . as $node | any($inbounds[];
             (.tag == $node.tag or .tag == ($node.protocol + "-in")) and
             .listen_port == ($node.config.listen_port // $node.config.port) and
             (($node.config.listen_addr // $node.config.listen) as $listen |
              $listen == null or .listen == $listen)))
-    ' "$CFG/singbox.json" >/dev/null 2>&1 ||
-       ! sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
-        _info "检测到 Sing-box 配置缺失、无效或遗漏节点，正在自动重建..."
-        _apply_singbox_config start || return 1
-        _ok "Sing-box 配置已自动修复"
-    fi
+    ' "$CFG/singbox.json" >/dev/null 2>&1 &&
+        sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1
 }
 
 stop_services() {
@@ -17455,7 +17451,8 @@ show_all_protocols_info() {
         if [[ -n "$singbox_protocols" ]]; then
             echo -e "  ${Y}Sing-box 协议 (vless-singbox 服务):${NC}"
             for protocol in $singbox_protocols; do
-                local port=$(db_get_field "singbox" "$protocol" "port")
+                local port
+                port=$(db_list_ports "singbox" "$protocol" | paste -sd ',' -)
                 if [[ -n "$port" ]]; then
                     echo -e "    ${G}$idx${NC}) $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
                     all_protocols+=("$protocol")
@@ -26718,7 +26715,8 @@ main_menu() {
     init_log  # 初始化日志
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
-    ensure_singbox_runtime_consistency 2>/dev/null || true
+    local singbox_config_warning=false
+    check_singbox_runtime_consistency 2>/dev/null || singbox_config_warning=true
 
     # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
     _auto_update_system_script
@@ -26778,6 +26776,9 @@ main_menu() {
         echo -e "  ${D}核心: Xray ${xray_ver_with_status} | Sing-box ${singbox_ver_with_status}${NC}"
         if [[ -n "$script_update_ver" ]]; then
             echo -e "  ${Y}提示: 脚本有新版本 v${script_update_ver}，可在菜单选择「检查脚本更新」${NC}"
+        fi
+        if $singbox_config_warning; then
+            echo -e "  ${Y}提示: Sing-box 配置未通过一致性检查，已保留现有配置。重建前请核对节点和后端监听。${NC}"
         fi
         echo ""
         show_status

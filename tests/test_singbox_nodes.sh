@@ -13,7 +13,7 @@ binary=$(command -v sing-box)
 
 for fn in init_db db_get db_exists db_list_ports register_protocol _singbox_db_nodes _build_singbox_inbound \
     generate_singbox_config _apply_singbox_config _change_singbox_nodes _merge_singbox_manual_routes _singbox_advertised_host \
-    ensure_singbox_runtime_consistency \
+    check_singbox_runtime_consistency \
     _singbox_stat_key_for_user _valid_trusted_cert_pair _valid_self_cert_pair _existing_acme_variant; do
     awk -v fn="$fn" '$0 ~ ("^" fn "\\(\\) \\{") {on=1} on {print} on && $0 == "}" {exit}' \
         "$root/vless-server.sh" >> "$tmp/functions.sh"
@@ -51,7 +51,10 @@ svc() {
 _singbox_service_ready() { "$running"; }
 sing-box() {
     if [[ "$1" == check ]]; then
-        [[ "$3" != "$CFG/singbox.json" ]] || return 1
+        if [[ "$3" == "$CFG/singbox.json" ]]; then
+            "$binary" "$@"
+            return
+        fi
         printf '%s\n' check >> "$tmp/service-events"
         if $fail_check; then return 1; fi
     fi
@@ -79,11 +82,27 @@ jq -e '(.inbounds | length)==2 and any(.inbounds[]; .tag=="anytls-in-25443" and 
     any(.route.rules[]; .inbound==["anytls-in-25443"] and .auth_user==["anytls-bob"])' "$CFG/singbox.json" >/dev/null
 
 # An older config can be valid with another protocol present but missing AnyTLS.
+check_singbox_runtime_consistency
+cp "$CFG/singbox.json" "$tmp/complete.json"
 jq '.inbounds = [{tag:"legacy-direct",type:"direct",listen:"::",listen_port:22443}] |
     del(.route.rules[] | select(.inbound != null))' "$CFG/singbox.json" > "$tmp/partial.json"
 "$binary" check -c "$tmp/partial.json"
-mv "$tmp/partial.json" "$CFG/singbox.json"
-ensure_singbox_runtime_consistency
+cp "$tmp/partial.json" "$CFG/singbox.json"
+: > "$tmp/service-events"
+if check_singbox_runtime_consistency; then exit 1; fi
+cmp "$CFG/singbox.json" "$tmp/partial.json"
+[[ ! -s "$tmp/service-events" ]]
+
+# Legacy records may omit the actual listener used behind a reverse proxy.
+cp "$DB_FILE" "$tmp/db-explicit"
+jq 'del(.singbox.anytls[0].listen_addr, .singbox.anytls[0].listen_port)' "$tmp/db-explicit" > "$DB_FILE"
+cp "$tmp/complete.json" "$CFG/singbox.json"
+if check_singbox_runtime_consistency; then exit 1; fi
+cmp "$CFG/singbox.json" "$tmp/complete.json"
+[[ ! -s "$tmp/service-events" ]]
+cp "$tmp/db-explicit" "$DB_FILE"
+
+_apply_singbox_config active
 jq -ce '.inbounds[] | select(.tag=="anytls-in-24443")' "$CFG/singbox.json" | cmp - "$tmp/inbound-a"
 
 cp "$DB_FILE" "$tmp/db-two"
